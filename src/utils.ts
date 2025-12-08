@@ -40,11 +40,23 @@ export function isExpired(expiresAt: number | null): boolean {
 }
 
 /**
+ * Compile a glob pattern to a RegExp for efficient reuse
+ */
+export function compilePattern(pattern: string): RegExp | null {
+  if (pattern === '*') return null; // null means "match all"
+  return new RegExp(
+    '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'
+  );
+}
+
+/**
  * Simple glob pattern matching for keys
  * Supports * as wildcard
+ * For bulk operations, use compilePattern() and pass the regex to avoid recompilation
  */
-export function matchPattern(key: string, pattern: string): boolean {
-  if (pattern === '*') return true;
+export function matchPattern(key: string, pattern: string | RegExp | null): boolean {
+  if (pattern === '*' || pattern === null) return true;
+  if (pattern instanceof RegExp) return pattern.test(key);
 
   const regex = new RegExp(
     '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'

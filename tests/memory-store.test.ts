@@ -166,4 +166,105 @@ describe('MemoryStore', () => {
       expect(store.stats.size).toBe(0);
     });
   });
+
+  describe('peek', () => {
+    it('should return entry without promoting to MRU', () => {
+      const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
+
+      smallStore.set('a', 1);
+      smallStore.set('b', 2);
+      smallStore.set('c', 3);
+
+      // Peek 'a' - should not promote it
+      const entry = smallStore.peek('a');
+      expect(entry?.value).toBe(1);
+
+      // Add 'd' - should evict 'a' since peek didn't promote it
+      smallStore.set('d', 4);
+
+      expect(smallStore.get('a')).toBeNull(); // evicted
+      expect(smallStore.get('b')).toBe(2);
+    });
+
+    it('should return null for non-existent keys', () => {
+      expect(store.peek('nonexistent')).toBeNull();
+    });
+
+    it('should return null for expired keys', async () => {
+      store.set('key', 'value', Date.now() + 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(store.peek('key')).toBeNull();
+    });
+  });
+
+  describe('LRU eviction with expired entries', () => {
+    it('should evict expired entries before LRU entries', async () => {
+      const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
+
+      // Add entry with TTL
+      smallStore.set('expiring', 'value', Date.now() + 50);
+      smallStore.set('permanent1', 'value');
+      smallStore.set('permanent2', 'value');
+
+      // Wait for expiration
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Add new entry - should evict expired one first
+      smallStore.set('new', 'value');
+
+      // Expired entry should be gone
+      expect(smallStore.get('expiring')).toBeNull();
+      // permanent1 should still exist (wasn't evicted because expired was evicted first)
+      expect(smallStore.get('permanent1')).toBe('value');
+    });
+  });
+
+  describe('has with expired entries', () => {
+    it('should return false and clean up expired entries', async () => {
+      store.set('key', 'value', Date.now() + 50);
+      expect(store.has('key')).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(store.has('key')).toBe(false);
+      // Entry should be cleaned up
+      expect(store.stats.items).toBe(0);
+    });
+  });
+
+  describe('setExpiry', () => {
+    it('should return false for non-existent keys', () => {
+      expect(store.setExpiry('nonexistent', Date.now() + 1000)).toBe(false);
+    });
+
+    it('should return false for expired keys', async () => {
+      store.set('key', 'value', Date.now() + 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(store.setExpiry('key', Date.now() + 1000)).toBe(false);
+    });
+
+    it('should allow removing expiry', () => {
+      store.set('key', 'value', Date.now() + 1000);
+      expect(store.getTtl('key')).toBeGreaterThan(0);
+
+      store.setExpiry('key', null);
+      expect(store.getTtl('key')).toBe(-1);
+    });
+  });
+
+  describe('keys with expired entries', () => {
+    it('should clean up expired entries when listing keys', async () => {
+      store.set('expiring', 'value', Date.now() + 50);
+      store.set('permanent', 'value');
+
+      expect(store.keys().sort()).toEqual(['expiring', 'permanent']);
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(store.keys()).toEqual(['permanent']);
+      expect(store.stats.items).toBe(1);
+    });
+  });
 });

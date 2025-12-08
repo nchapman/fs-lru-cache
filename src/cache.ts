@@ -20,9 +20,16 @@ export class FsLruCache {
   private readonly maxMemorySize: number;
   private hits = 0;
   private misses = 0;
+  private closed = false;
 
   // In-flight operations for stampede protection
   private inFlight: Map<string, Promise<unknown>> = new Map();
+
+  private assertOpen(): void {
+    if (this.closed) {
+      throw new Error('Cache is closed');
+    }
+  }
 
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
@@ -46,6 +53,7 @@ export class FsLruCache {
    * Checks memory first, then disk (promoting to memory on hit)
    */
   async get<T = unknown>(key: string): Promise<T | null> {
+    this.assertOpen();
     // Check memory first
     const memValue = this.memory.get<T>(key);
     if (memValue !== null) {
@@ -76,6 +84,7 @@ export class FsLruCache {
    * @param ttlMs Optional TTL in milliseconds
    */
   async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
+    this.assertOpen();
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
 
     // Serialize once for both stores
@@ -83,13 +92,14 @@ export class FsLruCache {
     const serialized = JSON.stringify(entry);
     const size = Buffer.byteLength(serialized, 'utf8');
 
+    // Write to disk first (atomic write, will throw on failure)
+    // This ensures memory doesn't have stale data if disk write fails
+    await this.files.set(key, value, expiresAt, serialized);
+
     // Write to memory (skip if too large)
     if (size <= this.maxMemorySize) {
       this.memory.set(key, value, expiresAt);
     }
-
-    // Write to disk (atomic write, will throw on failure)
-    await this.files.set(key, value, expiresAt, serialized);
   }
 
   /**
@@ -98,6 +108,7 @@ export class FsLruCache {
    * @returns true if the key was set, false if it already existed
    */
   async setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean> {
+    this.assertOpen();
     // Check if operation is already in flight
     const existing = this.inFlight.get(key);
     if (existing) {
@@ -127,6 +138,7 @@ export class FsLruCache {
    * Delete a key from the cache
    */
   async del(key: string): Promise<boolean> {
+    this.assertOpen();
     const memDeleted = this.memory.delete(key);
     const diskDeleted = await this.files.delete(key);
     return memDeleted || diskDeleted;
@@ -136,6 +148,7 @@ export class FsLruCache {
    * Check if a key exists in the cache
    */
   async exists(key: string): Promise<boolean> {
+    this.assertOpen();
     if (this.memory.has(key)) {
       return true;
     }
@@ -147,6 +160,7 @@ export class FsLruCache {
    * @param pattern Glob-like pattern (supports * wildcard)
    */
   async keys(pattern = '*'): Promise<string[]> {
+    this.assertOpen();
     // Get keys from both stores and deduplicate
     const memKeys = this.memory.keys(pattern);
     const diskKeys = await this.files.keys(pattern);
@@ -166,6 +180,7 @@ export class FsLruCache {
    * Set expiration time in milliseconds
    */
   async pexpire(key: string, ms: number): Promise<boolean> {
+    this.assertOpen();
     const expiresAt = Date.now() + ms;
 
     const memSuccess = this.memory.setExpiry(key, expiresAt);
@@ -179,6 +194,7 @@ export class FsLruCache {
    * @returns true if TTL was removed, false if key doesn't exist
    */
   async persist(key: string): Promise<boolean> {
+    this.assertOpen();
     const memSuccess = this.memory.setExpiry(key, null);
     const diskSuccess = await this.files.setExpiry(key, null);
 
@@ -200,6 +216,7 @@ export class FsLruCache {
    * Returns -1 if no expiry, -2 if key not found
    */
   async pttl(key: string): Promise<number> {
+    this.assertOpen();
     // Check memory first
     const memTtl = this.memory.getTtl(key);
     if (memTtl !== -2) {
@@ -242,6 +259,7 @@ export class FsLruCache {
     fn: () => T | Promise<T>,
     ttlMs?: number
   ): Promise<T> {
+    this.assertOpen();
     // Check cache first
     const existing = await this.get<T>(key);
     if (existing !== null) {
@@ -280,9 +298,12 @@ export class FsLruCache {
    * Get cache statistics
    */
   async stats(): Promise<CacheStats> {
+    this.assertOpen();
     const memStats = this.memory.stats;
-    const diskSize = await this.files.getSize();
-    const diskKeys = await this.files.keys();
+    const [diskSize, diskItemCount] = await Promise.all([
+      this.files.getSize(),
+      this.files.getItemCount(),
+    ]);
 
     return {
       hits: this.hits,
@@ -297,7 +318,7 @@ export class FsLruCache {
         maxSize: memStats.maxSize,
       },
       disk: {
-        items: diskKeys.length,
+        items: diskItemCount,
         size: diskSize,
       },
     };
@@ -315,16 +336,17 @@ export class FsLruCache {
    * Clear all entries from the cache
    */
   async clear(): Promise<void> {
+    this.assertOpen();
     this.memory.clear();
     await this.files.clear();
   }
 
   /**
    * Close the cache (cleanup)
-   * Currently a no-op but included for API completeness
+   * After closing, all operations will throw
    */
   async close(): Promise<void> {
-    // Clear in-flight operations
+    this.closed = true;
     this.inFlight.clear();
   }
 }

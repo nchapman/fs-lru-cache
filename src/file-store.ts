@@ -1,9 +1,8 @@
 import { promises as fs } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 import { CacheEntry } from './types.js';
-import { hashKey, getShardIndex, getShardName, isExpired, matchPattern } from './utils.js';
+import { hashKey, getShardIndex, getShardName, isExpired, compilePattern, matchPattern } from './utils.js';
 
 export interface FileStoreOptions {
   dir: string;
@@ -29,6 +28,8 @@ export class FileStore {
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
   private index: Map<string, IndexEntry> = new Map();
+  // Reverse mapping: hash -> key (to detect collisions on write)
+  private hashToKey: Map<string, string> = new Map();
   private totalSize = 0;
 
   constructor(options: FileStoreOptions) {
@@ -62,6 +63,7 @@ export class FileStore {
    */
   private async loadIndex(): Promise<void> {
     this.index.clear();
+    this.hashToKey.clear();
     this.totalSize = 0;
 
     for (let i = 0; i < this.shards; i++) {
@@ -94,6 +96,7 @@ export class FileStore {
               lastAccessedAt: stat.mtimeMs, // Use mtime for existing files
               size: stat.size,
             });
+            this.hashToKey.set(hash, data.key);
             this.totalSize += stat.size;
           } catch {
             // Skip invalid files
@@ -126,10 +129,11 @@ export class FileStore {
 
   /**
    * Generate a temporary file path for atomic writes
+   * Uses the cache directory to ensure same filesystem (avoids cross-device rename failures)
    */
   private getTempPath(): string {
     const id = randomBytes(8).toString('hex');
-    return join(tmpdir(), `fslru-${id}.tmp`);
+    return join(this.dir, `.tmp-${id}`);
   }
 
   /**
@@ -240,6 +244,17 @@ export class FileStore {
     const existing = this.index.get(key);
     if (existing) {
       this.totalSize -= existing.size;
+      this.hashToKey.delete(existing.hash);
+    }
+
+    // Handle hash collision: if another key owns this hash, remove it from index
+    const collidingKey = this.hashToKey.get(hash);
+    if (collidingKey && collidingKey !== key) {
+      const collidingEntry = this.index.get(collidingKey);
+      if (collidingEntry) {
+        this.totalSize -= collidingEntry.size;
+        this.index.delete(collidingKey);
+      }
     }
 
     // Check if we need to evict
@@ -255,6 +270,7 @@ export class FileStore {
       lastAccessedAt: Date.now(),
       size,
     });
+    this.hashToKey.set(hash, key);
     this.totalSize += size;
   }
 
@@ -272,6 +288,7 @@ export class FileStore {
     // Update index first
     this.totalSize -= indexEntry.size;
     this.index.delete(key);
+    this.hashToKey.delete(indexEntry.hash);
 
     try {
       await fs.unlink(filePath);
@@ -306,21 +323,20 @@ export class FileStore {
 
     const result: string[] = [];
     const toDelete: string[] = [];
+    const compiled = compilePattern(pattern);
 
     for (const [key, entry] of this.index) {
       if (isExpired(entry.expiresAt)) {
         toDelete.push(key);
         continue;
       }
-      if (matchPattern(key, pattern)) {
+      if (matchPattern(key, compiled)) {
         result.push(key);
       }
     }
 
-    // Clean up expired entries
-    for (const key of toDelete) {
-      await this.delete(key);
-    }
+    // Clean up expired entries in parallel
+    await Promise.all(toDelete.map((key) => this.delete(key)));
 
     return result;
   }
@@ -352,9 +368,11 @@ export class FileStore {
 
       await this.atomicWrite(filePath, serialized);
 
-      // Update index
+      // Update index and totalSize
+      const newSize = Buffer.byteLength(serialized, 'utf8');
+      this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
-      indexEntry.size = Buffer.byteLength(serialized, 'utf8');
+      indexEntry.size = newSize;
 
       return true;
     } catch {
@@ -400,6 +418,7 @@ export class FileStore {
     }
 
     this.index.clear();
+    this.hashToKey.clear();
     this.totalSize = 0;
   }
 
@@ -412,44 +431,74 @@ export class FileStore {
   }
 
   /**
+   * Get number of items in cache (fast - uses index)
+   */
+  async getItemCount(): Promise<number> {
+    await this.init();
+    return this.index.size;
+  }
+
+  /**
    * Ensure we have space for new data by evicting entries
    * Priority: expired items first, then LRU (oldest lastAccessedAt)
+   * Optimized to avoid sorting the entire index
    */
   private async ensureSpace(needed: number): Promise<void> {
     if (this.totalSize + needed <= this.maxSize) return;
 
     const now = Date.now();
-
-    // Sort entries: expired first, then by lastAccessedAt (oldest first)
-    const entries = Array.from(this.index.entries()).sort(([, a], [, b]) => {
-      const aExpired = a.expiresAt !== null && a.expiresAt <= now;
-      const bExpired = b.expiresAt !== null && b.expiresAt <= now;
-
-      if (aExpired && !bExpired) return -1;
-      if (!aExpired && bExpired) return 1;
-
-      return a.lastAccessedAt - b.lastAccessedAt;
-    });
-
-    let freed = 0;
     const target = this.totalSize + needed - this.maxSize;
+    let freed = 0;
 
-    for (const [key] of entries) {
-      if (freed >= target) break;
-
-      const entry = this.index.get(key);
-      if (!entry) continue;
-
-      const filePath = this.getFilePathFromHash(entry.hash, key);
-
-      try {
-        await fs.unlink(filePath);
-        freed += entry.size;
-        this.totalSize -= entry.size;
-        this.index.delete(key);
-      } catch {
-        // Ignore deletion errors
+    // First pass: delete all expired entries
+    const expiredKeys: string[] = [];
+    for (const [key, entry] of this.index) {
+      if (entry.expiresAt !== null && entry.expiresAt <= now) {
+        expiredKeys.push(key);
       }
+    }
+
+    for (const key of expiredKeys) {
+      if (freed >= target) return;
+      freed += await this.evictKey(key);
+    }
+
+    // Second pass: evict oldest entries until we have enough space
+    while (freed < target && this.index.size > 0) {
+      // Find the oldest entry (O(n) but avoids sorting everything)
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+
+      for (const [key, entry] of this.index) {
+        if (entry.lastAccessedAt < oldestTime) {
+          oldestTime = entry.lastAccessedAt;
+          oldestKey = key;
+        }
+      }
+
+      if (!oldestKey) break;
+      freed += await this.evictKey(oldestKey);
+    }
+  }
+
+  /**
+   * Evict a single key and return the freed size
+   */
+  private async evictKey(key: string): Promise<number> {
+    const entry = this.index.get(key);
+    if (!entry) return 0;
+
+    const filePath = this.getFilePathFromHash(entry.hash, key);
+
+    try {
+      await fs.unlink(filePath);
+      const freedSize = entry.size;
+      this.totalSize -= entry.size;
+      this.index.delete(key);
+      this.hashToKey.delete(entry.hash);
+      return freedSize;
+    } catch {
+      return 0;
     }
   }
 }

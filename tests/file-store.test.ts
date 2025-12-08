@@ -177,5 +177,184 @@ describe('FileStore', () => {
       const size = await store.getSize();
       expect(size).toBeGreaterThan(100);
     });
+
+    it('should track item count', async () => {
+      expect(await store.getItemCount()).toBe(0);
+
+      await store.set('a', 1);
+      expect(await store.getItemCount()).toBe(1);
+
+      await store.set('b', 2);
+      expect(await store.getItemCount()).toBe(2);
+
+      await store.delete('a');
+      expect(await store.getItemCount()).toBe(1);
+
+      await store.clear();
+      expect(await store.getItemCount()).toBe(0);
+    });
+
+    it('should update size correctly when overwriting', async () => {
+      await store.set('key', 'short');
+      const size1 = await store.getSize();
+
+      await store.set('key', 'a much longer value');
+      const size2 = await store.getSize();
+
+      expect(size2).toBeGreaterThan(size1);
+      expect(await store.getItemCount()).toBe(1);
+    });
+
+    it('should update totalSize when setExpiry changes file size', async () => {
+      // Set with no expiry (expiresAt: null)
+      await store.set('key', 'value');
+      const sizeWithoutTtl = await store.getSize();
+
+      // Set expiry (expiresAt: number) - file will be slightly larger
+      await store.setExpiry('key', Date.now() + 10000);
+      const sizeWithTtl = await store.getSize();
+
+      // Size should have changed (number takes more bytes than null)
+      expect(sizeWithTtl).not.toBe(sizeWithoutTtl);
+    });
+  });
+
+  describe('peek', () => {
+    it('should return entry without updating access time', async () => {
+      await store.set('a', 'value-a');
+
+      // Wait a bit
+      await new Promise((r) => setTimeout(r, 10));
+
+      await store.set('b', 'value-b');
+
+      // Peek 'a' should not update its access time
+      const entry = await store.peek('a');
+      expect(entry?.value).toBe('value-a');
+
+      // Now 'a' should still be older than 'b' for LRU purposes
+      // We can verify this by checking get() behavior
+      const getEntry = await store.get('a');
+      expect(getEntry?.value).toBe('value-a');
+    });
+
+    it('should return null for non-existent keys', async () => {
+      expect(await store.peek('nonexistent')).toBeNull();
+    });
+
+    it('should return null for expired keys', async () => {
+      await store.set('key', 'value', Date.now() + 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(await store.peek('key')).toBeNull();
+    });
+  });
+
+  describe('LRU eviction', () => {
+    it('should evict oldest entries when size limit exceeded', async () => {
+      const smallStore = new FileStore({
+        dir: TEST_DIR + '-lru',
+        shards: 2,
+        maxSize: 180, // Very small limit - only fits ~2 entries
+      });
+
+      // Each entry is about 80 bytes: {"key":"first","value":"xxxx...","expiresAt":null}
+      await smallStore.set('first', 'x'.repeat(40));
+
+      // Small delay to ensure different timestamps
+      await new Promise((r) => setTimeout(r, 5));
+
+      await smallStore.set('second', 'x'.repeat(40));
+
+      // Small delay before accessing
+      await new Promise((r) => setTimeout(r, 5));
+
+      // Access 'first' to make it more recently used
+      await smallStore.get('first');
+
+      // Small delay before adding third entry
+      await new Promise((r) => setTimeout(r, 5));
+
+      // Add more to trigger eviction
+      await smallStore.set('third', 'x'.repeat(40));
+
+      // 'second' should be evicted (oldest not accessed)
+      expect(await smallStore.get('second')).toBeNull();
+      expect(await smallStore.get('first')).not.toBeNull();
+      expect(await smallStore.get('third')).not.toBeNull();
+
+      await fs.rm(TEST_DIR + '-lru', { recursive: true, force: true });
+    });
+
+    it('should evict expired entries before LRU entries', async () => {
+      const smallStore = new FileStore({
+        dir: TEST_DIR + '-expire-lru',
+        shards: 2,
+        maxSize: 250,
+      });
+
+      // Add entry with TTL
+      await smallStore.set('expiring', 'x'.repeat(50), Date.now() + 50);
+      // Add entry without TTL
+      await smallStore.set('permanent', 'x'.repeat(50));
+
+      // Wait for expiration
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Add more to trigger eviction
+      await smallStore.set('new', 'x'.repeat(50));
+
+      // Expired entry should be gone, permanent should remain
+      expect(await smallStore.get('expiring')).toBeNull();
+      expect(await smallStore.get('permanent')).not.toBeNull();
+
+      await fs.rm(TEST_DIR + '-expire-lru', { recursive: true, force: true });
+    });
+  });
+
+  describe('persistence and recovery', () => {
+    it('should recover index from disk on restart', async () => {
+      await store.set('key1', 'value1');
+      await store.set('key2', 'value2', Date.now() + 60000);
+
+      // Create a new store instance pointing to same dir
+      const newStore = new FileStore({
+        dir: TEST_DIR,
+        shards: 4,
+        maxSize: 1024 * 1024,
+      });
+
+      // Should be able to read existing data
+      const entry1 = await newStore.get('key1');
+      expect(entry1?.value).toBe('value1');
+
+      const entry2 = await newStore.get('key2');
+      expect(entry2?.value).toBe('value2');
+
+      // Item count should be restored
+      expect(await newStore.getItemCount()).toBe(2);
+    });
+
+    it('should clean up expired entries on load', async () => {
+      await store.set('expiring', 'value', Date.now() + 50);
+      await store.set('permanent', 'value');
+
+      // Wait for expiration
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Create new store - should clean up expired entry
+      const newStore = new FileStore({
+        dir: TEST_DIR,
+        shards: 4,
+        maxSize: 1024 * 1024,
+      });
+
+      // Force initialization
+      await newStore.keys();
+
+      // Only permanent should exist
+      expect(await newStore.getItemCount()).toBe(1);
+      expect(await newStore.get('permanent')).not.toBeNull();
+    });
   });
 });

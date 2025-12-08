@@ -239,6 +239,351 @@ describe('FsLruCache', () => {
       await smallMemCache.close();
       await fs.rm(TEST_DIR + '-small', { recursive: true, force: true });
     });
+
+    it('should preserve data on disk when memory evicts', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-mem-evict',
+        maxMemoryItems: 2,
+        maxMemorySize: 1024,
+        maxDiskSize: 10 * 1024,
+        shards: 2,
+      });
+
+      // Fill memory
+      await smallMemCache.set('first', 'value-first');
+      await smallMemCache.set('second', 'value-second');
+
+      // This evicts 'first' from memory
+      await smallMemCache.set('third', 'value-third');
+
+      // Stats should show 2 in memory, 3 on disk
+      const stats = await smallMemCache.stats();
+      expect(stats.memory.items).toBe(2);
+      expect(stats.disk.items).toBe(3);
+
+      // 'first' should still be retrievable from disk
+      expect(await smallMemCache.get('first')).toBe('value-first');
+
+      // After get, 'first' should be promoted back to memory
+      // (evicting another item)
+      const statsAfter = await smallMemCache.stats();
+      expect(statsAfter.memory.items).toBe(2);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-mem-evict', { recursive: true, force: true });
+    });
+
+    it('should track hits from memory vs disk correctly', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-hit-track',
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallMemCache.set('a', 'A');
+      await smallMemCache.set('b', 'B'); // Evicts 'a' from memory
+
+      // Get 'b' - should be memory hit
+      await smallMemCache.get('b');
+
+      // Get 'a' - should be disk hit (and promote to memory)
+      await smallMemCache.get('a');
+
+      // Get 'a' again - should be memory hit now
+      await smallMemCache.get('a');
+
+      // Get 'nonexistent' - should be miss
+      await smallMemCache.get('nonexistent');
+
+      const stats = await smallMemCache.stats();
+      expect(stats.hits).toBe(3);
+      expect(stats.misses).toBe(1);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-hit-track', { recursive: true, force: true });
+    });
+
+    it('should write to both tiers on set', async () => {
+      await cache.set('both-tiers', 'value');
+
+      const stats = await cache.stats();
+      expect(stats.memory.items).toBeGreaterThanOrEqual(1);
+      expect(stats.disk.items).toBeGreaterThanOrEqual(1);
+
+      // Verify by creating new cache instance (reads from disk)
+      await cache.close();
+      const newCache = new FsLruCache({ dir: TEST_DIR, shards: 4 });
+      expect(await newCache.get('both-tiers')).toBe('value');
+      await newCache.close();
+
+      // Recreate original cache for cleanup
+      cache = new FsLruCache({
+        dir: TEST_DIR,
+        maxMemoryItems: 10,
+        maxMemorySize: 1024,
+        maxDiskSize: 1024 * 1024,
+        shards: 4,
+      });
+    });
+
+    it('should delete from both tiers', async () => {
+      const testCache = new FsLruCache({
+        dir: TEST_DIR + '-del-both',
+        maxMemoryItems: 10,
+        shards: 2,
+      });
+
+      await testCache.set('to-delete', 'value');
+
+      // Verify it's in both tiers
+      const beforeStats = await testCache.stats();
+      expect(beforeStats.memory.items).toBe(1);
+      expect(beforeStats.disk.items).toBe(1);
+
+      // Delete
+      await testCache.del('to-delete');
+
+      // Should be gone from both
+      const afterStats = await testCache.stats();
+      expect(afterStats.memory.items).toBe(0);
+      expect(afterStats.disk.items).toBe(0);
+
+      // Verify truly gone
+      expect(await testCache.get('to-delete')).toBeNull();
+
+      await testCache.close();
+      await fs.rm(TEST_DIR + '-del-both', { recursive: true, force: true });
+    });
+
+    it('should update TTL in both tiers', async () => {
+      const testCache = new FsLruCache({
+        dir: TEST_DIR + '-ttl-both',
+        maxMemoryItems: 10,
+        shards: 2,
+      });
+
+      // Set without TTL
+      await testCache.set('key', 'value');
+      expect(await testCache.pttl('key')).toBe(-1);
+
+      // Add TTL
+      await testCache.pexpire('key', 5000);
+
+      // TTL should be set
+      const ttl = await testCache.pttl('key');
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+
+      // Verify TTL persists to disk
+      await testCache.close();
+      const newCache = new FsLruCache({
+        dir: TEST_DIR + '-ttl-both',
+        shards: 2,
+      });
+
+      const persistedTtl = await newCache.pttl('key');
+      expect(persistedTtl).toBeGreaterThan(3000); // Some time may have passed
+
+      await newCache.close();
+      await fs.rm(TEST_DIR + '-ttl-both', { recursive: true, force: true });
+    });
+
+    it('should sync persist() to both tiers', async () => {
+      const testCache = new FsLruCache({
+        dir: TEST_DIR + '-persist-both',
+        maxMemoryItems: 10,
+        shards: 2,
+      });
+
+      // Set with TTL
+      await testCache.set('key', 'value', 5000);
+      expect(await testCache.pttl('key')).toBeGreaterThan(0);
+
+      // Remove TTL
+      await testCache.persist('key');
+      expect(await testCache.pttl('key')).toBe(-1);
+
+      // Verify persist applies to disk
+      await testCache.close();
+      const newCache = new FsLruCache({
+        dir: TEST_DIR + '-persist-both',
+        shards: 2,
+      });
+
+      expect(await newCache.pttl('key')).toBe(-1);
+      expect(await newCache.get('key')).toBe('value');
+
+      await newCache.close();
+      await fs.rm(TEST_DIR + '-persist-both', { recursive: true, force: true });
+    });
+
+    it('should handle overwrite in both tiers', async () => {
+      const testCache = new FsLruCache({
+        dir: TEST_DIR + '-overwrite',
+        maxMemoryItems: 10,
+        shards: 2,
+      });
+
+      await testCache.set('key', 'original');
+      await testCache.set('key', 'updated');
+
+      // Memory should have updated value
+      expect(await testCache.get('key')).toBe('updated');
+
+      // Verify disk also has updated value
+      await testCache.close();
+      const newCache = new FsLruCache({
+        dir: TEST_DIR + '-overwrite',
+        shards: 2,
+      });
+
+      expect(await newCache.get('key')).toBe('updated');
+
+      await newCache.close();
+      await fs.rm(TEST_DIR + '-overwrite', { recursive: true, force: true });
+    });
+
+    it('should handle value in disk only after memory eviction', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-disk-only',
+        maxMemoryItems: 1,
+        maxMemorySize: 100,
+        shards: 2,
+      });
+
+      // Set two values, second evicts first from memory
+      await smallMemCache.set('evicted', 'evicted-value');
+      await smallMemCache.set('current', 'current-value');
+
+      // 'evicted' is only on disk, 'current' is in both
+      const stats = await smallMemCache.stats();
+      expect(stats.memory.items).toBe(1);
+      expect(stats.disk.items).toBe(2);
+
+      // Getting 'evicted' should work (from disk) and promote it
+      expect(await smallMemCache.get('evicted')).toBe('evicted-value');
+
+      // Now 'evicted' is in memory, 'current' might be evicted
+      expect(await smallMemCache.get('evicted')).toBe('evicted-value'); // Memory hit
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-disk-only', { recursive: true, force: true });
+    });
+
+    it('should preserve TTL when promoting from disk to memory', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-ttl-promote',
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      // Set with TTL, then evict from memory
+      await smallMemCache.set('with-ttl', 'value', 5000);
+      await smallMemCache.set('other', 'other-value'); // Evicts 'with-ttl' from memory
+
+      // Get should promote and preserve TTL
+      expect(await smallMemCache.get('with-ttl')).toBe('value');
+
+      // TTL should still be set
+      const ttl = await smallMemCache.pttl('with-ttl');
+      expect(ttl).toBeGreaterThan(4000);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-ttl-promote', { recursive: true, force: true });
+    });
+
+    it('should handle large value that only goes to disk', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-large-disk',
+        maxMemoryItems: 10,
+        maxMemorySize: 50, // Very small memory
+        maxDiskSize: 10 * 1024,
+        shards: 2,
+      });
+
+      // Large value exceeds memory limit
+      const largeValue = 'x'.repeat(100);
+      await smallMemCache.set('large', largeValue);
+
+      // Should be on disk only
+      const stats = await smallMemCache.stats();
+      expect(stats.memory.items).toBe(0);
+      expect(stats.disk.items).toBe(1);
+
+      // Should still be retrievable
+      expect(await smallMemCache.get('large')).toBe(largeValue);
+
+      // After get, still shouldn't be in memory (too large)
+      const statsAfter = await smallMemCache.stats();
+      expect(statsAfter.memory.items).toBe(0);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-large-disk', { recursive: true, force: true });
+    });
+
+    it('should handle mixed small and large values', async () => {
+      const mixedCache = new FsLruCache({
+        dir: TEST_DIR + '-mixed-size',
+        maxMemoryItems: 10,
+        maxMemorySize: 100,
+        maxDiskSize: 10 * 1024,
+        shards: 2,
+      });
+
+      // Small value goes to both tiers
+      await mixedCache.set('small', 'tiny');
+
+      // Large value goes to disk only
+      await mixedCache.set('large', 'x'.repeat(200));
+
+      const stats = await mixedCache.stats();
+      expect(stats.memory.items).toBe(1); // Only 'small'
+      expect(stats.disk.items).toBe(2); // Both
+
+      // Both should be retrievable
+      expect(await mixedCache.get('small')).toBe('tiny');
+      expect(await mixedCache.get('large')).toBe('x'.repeat(200));
+
+      await mixedCache.close();
+      await fs.rm(TEST_DIR + '-mixed-size', { recursive: true, force: true });
+    });
+
+    it('should handle exists() checking both tiers', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-exists-both',
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallMemCache.set('first', 'value');
+      await smallMemCache.set('second', 'value'); // Evicts 'first' from memory
+
+      // 'first' is only on disk, 'second' is in memory
+      expect(await smallMemCache.exists('first')).toBe(true); // Disk check
+      expect(await smallMemCache.exists('second')).toBe(true); // Memory check
+      expect(await smallMemCache.exists('nonexistent')).toBe(false);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-exists-both', { recursive: true, force: true });
+    });
+
+    it('should handle keys() returning from both tiers', async () => {
+      const smallMemCache = new FsLruCache({
+        dir: TEST_DIR + '-keys-both',
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallMemCache.set('mem-and-disk', 'value1');
+      await smallMemCache.set('only-in-mem', 'value2'); // Evicts first from memory
+
+      // keys() should return both (deduped)
+      const keys = await smallMemCache.keys();
+      expect(keys.sort()).toEqual(['mem-and-disk', 'only-in-mem']);
+
+      await smallMemCache.close();
+      await fs.rm(TEST_DIR + '-keys-both', { recursive: true, force: true });
+    });
   });
 
   describe('edge cases', () => {
@@ -527,6 +872,74 @@ describe('FsLruCache', () => {
     });
   });
 
+  describe('close', () => {
+    it('should throw on get after close', async () => {
+      await cache.set('key', 'value');
+      await cache.close();
+      await expect(cache.get('key')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on set after close', async () => {
+      await cache.close();
+      await expect(cache.set('key', 'value')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on del after close', async () => {
+      await cache.close();
+      await expect(cache.del('key')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on exists after close', async () => {
+      await cache.close();
+      await expect(cache.exists('key')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on keys after close', async () => {
+      await cache.close();
+      await expect(cache.keys()).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on stats after close', async () => {
+      await cache.close();
+      await expect(cache.stats()).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on clear after close', async () => {
+      await cache.close();
+      await expect(cache.clear()).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on getOrSet after close', async () => {
+      await cache.close();
+      await expect(cache.getOrSet('key', () => 'value')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on setnx after close', async () => {
+      await cache.close();
+      await expect(cache.setnx('key', 'value')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on pexpire after close', async () => {
+      await cache.close();
+      await expect(cache.pexpire('key', 1000)).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on pttl after close', async () => {
+      await cache.close();
+      await expect(cache.pttl('key')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should throw on persist after close', async () => {
+      await cache.close();
+      await expect(cache.persist('key')).rejects.toThrow('Cache is closed');
+    });
+
+    it('should allow close to be called multiple times', async () => {
+      await cache.close();
+      await expect(cache.close()).resolves.toBeUndefined();
+    });
+  });
+
   describe('getOrSet', () => {
     it('should return existing value without calling fn', async () => {
       await cache.set('key', 'existing');
@@ -633,6 +1046,186 @@ describe('FsLruCache', () => {
         'computed-1',
         'computed-1',
       ]);
+    });
+
+    it('should propagate errors from fn', async () => {
+      const errorFn = async () => {
+        throw new Error('computation failed');
+      };
+
+      await expect(cache.getOrSet('error-key', errorFn)).rejects.toThrow('computation failed');
+    });
+
+    it('should not cache value when fn throws', async () => {
+      let callCount = 0;
+
+      const maybeErrorFn = async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('first call fails');
+        }
+        return 'success';
+      };
+
+      // First call should fail
+      await expect(cache.getOrSet('retry-key', maybeErrorFn)).rejects.toThrow('first call fails');
+
+      // Second call should work (key should not be cached)
+      const result = await cache.getOrSet('retry-key', maybeErrorFn);
+      expect(result).toBe('success');
+      expect(callCount).toBe(2);
+    });
+  });
+
+  describe('expired key behavior', () => {
+    it('exists() should return false for expired keys', async () => {
+      await cache.set('key', 'value', 50);
+      expect(await cache.exists('key')).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(await cache.exists('key')).toBe(false);
+    });
+
+    it('del() should clean up expired keys from disk', async () => {
+      await cache.set('key', 'value', 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      // Key is expired but file still exists on disk, del cleans it up
+      // and returns true because it successfully removed the file
+      expect(await cache.del('key')).toBe(true);
+
+      // Key should now be fully gone
+      expect(await cache.exists('key')).toBe(false);
+    });
+
+    it('keys() should not return expired keys', async () => {
+      await cache.set('short', 'value', 50);
+      await cache.set('long', 'value', 5000);
+
+      expect((await cache.keys()).sort()).toEqual(['long', 'short']);
+
+      await new Promise((r) => setTimeout(r, 60));
+      expect(await cache.keys()).toEqual(['long']);
+    });
+
+    it('persist() should return false for expired keys', async () => {
+      await cache.set('key', 'value', 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(await cache.persist('key')).toBe(false);
+    });
+
+    it('pexpire() should return false for expired keys', async () => {
+      await cache.set('key', 'value', 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(await cache.pexpire('key', 5000)).toBe(false);
+    });
+  });
+
+  describe('pattern matching', () => {
+    it('should match prefix patterns', async () => {
+      await cache.set('user:1:name', 'Alice');
+      await cache.set('user:1:email', 'alice@test.com');
+      await cache.set('user:2:name', 'Bob');
+      await cache.set('post:1', 'content');
+
+      expect((await cache.keys('user:1:*')).sort()).toEqual(['user:1:email', 'user:1:name']);
+    });
+
+    it('should match suffix patterns', async () => {
+      await cache.set('user:1:name', 'Alice');
+      await cache.set('user:2:name', 'Bob');
+      await cache.set('user:1:email', 'alice@test.com');
+
+      expect((await cache.keys('*:name')).sort()).toEqual(['user:1:name', 'user:2:name']);
+    });
+
+    it('should match middle patterns', async () => {
+      await cache.set('cache:user:1', 'value1');
+      await cache.set('cache:post:1', 'value2');
+      await cache.set('store:user:1', 'value3');
+
+      expect((await cache.keys('cache:*:1')).sort()).toEqual(['cache:post:1', 'cache:user:1']);
+    });
+
+    it('should match multiple wildcards', async () => {
+      await cache.set('a:b:c', 1);
+      await cache.set('a:x:c', 2);
+      await cache.set('a:b:z', 3);
+
+      expect((await cache.keys('a:*:*')).sort()).toEqual(['a:b:c', 'a:b:z', 'a:x:c']);
+    });
+
+    it('should escape regex special characters in patterns', async () => {
+      await cache.set('file.txt', 'content');
+      await cache.set('file-txt', 'other');
+
+      // The dot should be literal, not regex wildcard
+      expect(await cache.keys('file.txt')).toEqual(['file.txt']);
+    });
+
+    it('should return empty array when no matches', async () => {
+      await cache.set('a', 1);
+      await cache.set('b', 2);
+
+      expect(await cache.keys('x*')).toEqual([]);
+    });
+  });
+
+  describe('disk eviction', () => {
+    it('should evict expired entries first when disk is full', async () => {
+      const smallCache = new FsLruCache({
+        dir: TEST_DIR + '-eviction',
+        maxMemoryItems: 100,
+        maxMemorySize: 10 * 1024 * 1024,
+        maxDiskSize: 500, // Very small disk limit
+        shards: 2,
+      });
+
+      // Set an entry with TTL
+      await smallCache.set('expiring', 'x'.repeat(100), 50);
+      // Set entries without TTL
+      await smallCache.set('permanent1', 'x'.repeat(100));
+      await smallCache.set('permanent2', 'x'.repeat(100));
+
+      // Wait for TTL to expire
+      await new Promise((r) => setTimeout(r, 60));
+
+      // This should trigger eviction, preferring the expired entry
+      await smallCache.set('new', 'x'.repeat(100));
+
+      // Expired entry should be gone
+      expect(await smallCache.get('expiring')).toBeNull();
+
+      // New entry should exist
+      expect(await smallCache.get('new')).not.toBeNull();
+
+      await smallCache.close();
+      await fs.rm(TEST_DIR + '-eviction', { recursive: true, force: true });
+    });
+
+    it('should evict entries when disk size limit exceeded', async () => {
+      const smallCache = new FsLruCache({
+        dir: TEST_DIR + '-lru-eviction',
+        maxMemoryItems: 10,
+        maxMemorySize: 10 * 1024,
+        maxDiskSize: 180, // Very small disk limit - only fits ~2 entries
+        shards: 2,
+      });
+
+      // Add entries (each ~80 bytes with JSON overhead)
+      await smallCache.set('a', 'x'.repeat(40));
+      await smallCache.set('b', 'x'.repeat(40));
+      await smallCache.set('c', 'x'.repeat(40));
+
+      // Disk should have evicted at least one entry
+      const stats = await smallCache.stats();
+      expect(stats.disk.items).toBeLessThan(3);
+      expect(stats.disk.size).toBeLessThanOrEqual(180);
+
+      await smallCache.close();
+      await fs.rm(TEST_DIR + '-lru-eviction', { recursive: true, force: true });
     });
   });
 });

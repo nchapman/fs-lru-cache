@@ -1,5 +1,5 @@
 import { MemoryEntry } from './types.js';
-import { estimateSize, isExpired, matchPattern } from './utils.js';
+import { estimateSize, isExpired, compilePattern, matchPattern } from './utils.js';
 
 export interface MemoryStoreOptions {
   maxItems: number;
@@ -113,13 +113,14 @@ export class MemoryStore {
    */
   keys(pattern = '*'): string[] {
     const result: string[] = [];
+    const compiled = compilePattern(pattern);
 
     for (const [key, entry] of this.cache) {
       if (isExpired(entry.expiresAt)) {
         this.delete(key);
         continue;
       }
-      if (matchPattern(key, pattern)) {
+      if (matchPattern(key, compiled)) {
         result.push(key);
       }
     }
