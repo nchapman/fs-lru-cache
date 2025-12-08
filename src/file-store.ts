@@ -379,6 +379,47 @@ export class FileStore {
   }
 
   /**
+   * Touch a key: update last accessed time and optionally update TTL.
+   * If expiresAt is provided, rewrites the file with new expiry.
+   * If not provided, only updates the in-memory index (fast path).
+   */
+  async touch(key: string, expiresAt?: number | null): Promise<boolean> {
+    await this.init();
+
+    const indexEntry = await this.getValidIndexEntry(key);
+    if (!indexEntry) return false;
+
+    // Always update last accessed time
+    indexEntry.lastAccessedAt = Date.now();
+
+    // If new expiry provided, need to rewrite file
+    if (expiresAt !== undefined) {
+      const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+
+      try {
+        const content = await fs.readFile(filePath, "utf8");
+        const entry: CacheEntry = JSON.parse(content);
+
+        if (entry.key !== key) return false;
+
+        entry.expiresAt = expiresAt;
+        const serialized = JSON.stringify(entry);
+        await this.atomicWrite(filePath, serialized);
+
+        // Update index
+        const newSize = Buffer.byteLength(serialized, "utf8");
+        this.totalSize += newSize - indexEntry.size;
+        indexEntry.expiresAt = expiresAt;
+        indexEntry.size = newSize;
+      } catch {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
    * Clear all entries
    */
   async clear(): Promise<void> {

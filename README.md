@@ -76,6 +76,8 @@ await cache.mset([
 ```typescript
 await cache.setnx(key, value, ttlMs?)      // Set only if not exists
 await cache.getOrSet(key, fn, ttlMs?)      // Get or compute and cache
+await cache.touch(key, ttlMs?)             // Refresh LRU position, optionally update TTL
+await cache.size()                         // Get total number of items
 await cache.stats()                        // Get cache statistics
 cache.resetStats()                         // Reset hit/miss counters
 await cache.close()                        // Cleanup (call when done)
@@ -90,7 +92,39 @@ const cache = new FsLruCache({
   maxMemorySize: 50_000_000, // Max memory in bytes (default: 50MB)
   maxDiskSize: 500_000_000, // Max disk usage in bytes (default: 500MB)
   shards: 16, // Number of subdirectories (default: 16)
+  defaultTtl: 300_000, // Default TTL in ms for all entries (default: none)
+  namespace: "myapp", // Key prefix for multi-tenant apps (default: none)
 });
+```
+
+### Default TTL
+
+Set a default expiration for all entries:
+
+```typescript
+// All items expire after 5 minutes unless overridden
+const cache = new FsLruCache({ defaultTtl: 300_000 });
+
+await cache.set("key", "value"); // Expires in 5 minutes
+await cache.set("key2", "value", 60_000); // Override: expires in 1 minute
+await cache.set("key3", "value", 0); // Override: never expires
+```
+
+### Namespace
+
+Isolate cache entries with automatic key prefixing:
+
+```typescript
+const userCache = new FsLruCache({ namespace: "users", dir: ".cache" });
+const postCache = new FsLruCache({ namespace: "posts", dir: ".cache" });
+
+// Keys are automatically prefixed (stored as "users:123" and "posts:456")
+await userCache.set("123", { name: "Alice" });
+await postCache.set("456", { title: "Hello" });
+
+// No conflicts - each namespace is isolated
+await userCache.get("123"); // { name: "Alice" }
+await postCache.get("123"); // null
 ```
 
 ## Examples
@@ -100,14 +134,14 @@ const cache = new FsLruCache({
 ```typescript
 const sessions = new FsLruCache({ dir: ".sessions" });
 
-// Create session
+// Create session (24 hour TTL)
 await sessions.setnx(`session:${id}`, { userId, createdAt: Date.now() }, 86400000);
 
 // Get session
 const session = await sessions.get(`session:${id}`);
 
-// Extend session
-await sessions.expire(`session:${id}`, 86400);
+// Keep session alive on activity (refresh TTL without reading value)
+await sessions.touch(`session:${id}`, 86400000);
 ```
 
 ### Caching Database Queries
@@ -129,6 +163,10 @@ async function getUser(id: number) {
 ### Statistics
 
 ```typescript
+// Quick item count
+console.log(`Cache has ${await cache.size()} items`);
+
+// Detailed stats
 const stats = await cache.stats();
 console.log(`Hit rate: ${(stats.hitRate * 100).toFixed(1)}%`);
 console.log(`Memory: ${stats.memory.items} items, ${stats.memory.size} bytes`);

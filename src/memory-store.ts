@@ -125,6 +125,25 @@ export class MemoryStore {
   }
 
   /**
+   * Touch a key: promote to most recently used and optionally update TTL.
+   * Does not read or return the value.
+   */
+  touch(key: string, expiresAt?: number | null): boolean {
+    const entry = this.getValidEntry(key);
+    if (!entry) return false;
+
+    // Update expiry if provided
+    if (expiresAt !== undefined) {
+      entry.expiresAt = expiresAt;
+    }
+
+    // Promote to most recently used by re-inserting
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return true;
+  }
+
+  /**
    * Get TTL for a key in milliseconds.
    * Returns -1 if no expiry, -2 if not found.
    */

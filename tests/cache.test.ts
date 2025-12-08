@@ -677,6 +677,145 @@ describe("FsLruCache", () => {
     });
   });
 
+  describe("touch", () => {
+    it("should return true for existing key", async () => {
+      await cache.set("key", "value");
+      expect(await cache.touch("key")).toBe(true);
+    });
+
+    it("should return false for non-existent key", async () => {
+      expect(await cache.touch("nonexistent")).toBe(false);
+    });
+
+    it("should update TTL when provided", async () => {
+      await cache.set("key", "value", 1000);
+      await cache.touch("key", 5000);
+      const ttl = await cache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+    });
+
+    it("should preserve TTL when not provided", async () => {
+      await cache.set("key", "value", 5000);
+      await delay(100);
+      await cache.touch("key");
+      const ttl = await cache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThan(5000);
+    });
+
+    it("should preserve value", async () => {
+      await cache.set("key", { data: "test" });
+      await cache.touch("key", 5000);
+      expect(await cache.get("key")).toEqual({ data: "test" });
+    });
+
+    it("should return false for expired keys", async () => {
+      await cache.set("key", "value", 50);
+      await delay(60);
+      expect(await cache.touch("key")).toBe(false);
+    });
+
+    it("should refresh LRU position in memory", async () => {
+      const smallCache = createTestCache("touch-lru", { maxMemoryItems: 2, shards: 2 });
+
+      await smallCache.set("a", "A");
+      await smallCache.set("b", "B");
+      await smallCache.touch("a"); // Promote 'a' to most recent
+      await smallCache.set("c", "C"); // Should evict 'b', not 'a'
+
+      const stats = await smallCache.stats();
+      expect(stats.memory.items).toBe(2);
+
+      // 'a' should still be in memory (was touched)
+      // 'b' was evicted
+      // We can verify by checking the value is retrievable
+      expect(await smallCache.get("a")).toBe("A");
+
+      await smallCache.close();
+    });
+
+    it("should work on keys only in disk", async () => {
+      const smallCache = createTestCache("touch-disk", { maxMemoryItems: 1, shards: 2 });
+
+      await smallCache.set("disk-only", "value");
+      await smallCache.set("in-memory", "value2"); // Evicts disk-only from memory
+
+      expect(await smallCache.touch("disk-only", 5000)).toBe(true);
+      expect(await smallCache.pttl("disk-only")).toBeGreaterThan(4000);
+
+      await smallCache.close();
+    });
+
+    it("should persist TTL changes to disk", async () => {
+      await cache.set("key", "value", 1000);
+      await cache.touch("key", 10000);
+      await cache.close();
+
+      const dir = testDir("integration");
+      const newCache = new FsLruCache({ dir, shards: 4 });
+      expect(await newCache.pttl("key")).toBeGreaterThan(9000);
+      await newCache.close();
+
+      cache = createTestCache("integration");
+    });
+  });
+
+  describe("size", () => {
+    it("should return 0 for empty cache", async () => {
+      expect(await cache.size()).toBe(0);
+    });
+
+    it("should return correct count after adding items", async () => {
+      await cache.set("a", 1);
+      await cache.set("b", 2);
+      await cache.set("c", 3);
+      expect(await cache.size()).toBe(3);
+    });
+
+    it("should decrease after deleting items", async () => {
+      await cache.set("a", 1);
+      await cache.set("b", 2);
+      await cache.del("a");
+      expect(await cache.size()).toBe(1);
+    });
+
+    it("should return 0 after clear", async () => {
+      await cache.set("a", 1);
+      await cache.set("b", 2);
+      await cache.clear();
+      expect(await cache.size()).toBe(0);
+    });
+
+    it("should not count expired items", async () => {
+      await cache.set("short", "value", 50);
+      await cache.set("long", "value", 5000);
+      expect(await cache.size()).toBe(2);
+
+      await delay(60);
+      // Access to trigger lazy expiration cleanup
+      await cache.exists("short");
+      expect(await cache.size()).toBe(1);
+    });
+
+    it("should count items only on disk (large values)", async () => {
+      const smallCache = createTestCache("size-disk", {
+        maxMemoryItems: 10,
+        maxMemorySize: 50,
+        shards: 2,
+      });
+
+      await smallCache.set("large", "x".repeat(100));
+      expect(await smallCache.size()).toBe(1);
+
+      const stats = await smallCache.stats();
+      expect(stats.memory.items).toBe(0);
+      expect(stats.disk.items).toBe(1);
+
+      await smallCache.close();
+    });
+  });
+
   describe("close", () => {
     const closedCacheTests = [
       { method: "get", fn: (c: FsLruCache) => c.get("key") },
@@ -691,6 +830,8 @@ describe("FsLruCache", () => {
       { method: "pexpire", fn: (c: FsLruCache) => c.pexpire("key", 1000) },
       { method: "pttl", fn: (c: FsLruCache) => c.pttl("key") },
       { method: "persist", fn: (c: FsLruCache) => c.persist("key") },
+      { method: "touch", fn: (c: FsLruCache) => c.touch("key") },
+      { method: "size", fn: (c: FsLruCache) => c.size() },
     ];
 
     it.each(closedCacheTests)("should throw on $method after close", async ({ fn }) => {
@@ -908,6 +1049,228 @@ describe("FsLruCache", () => {
       await cache.set("b", 2);
 
       expect(await cache.keys("x*")).toEqual([]);
+    });
+  });
+
+  describe("defaultTtl", () => {
+    it("should apply defaultTtl when no TTL is provided", async () => {
+      const ttlCache = createTestCache("default-ttl", { defaultTtl: 5000 });
+      await ttlCache.set("key", "value");
+
+      const ttl = await ttlCache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+
+      await ttlCache.close();
+    });
+
+    it("should allow overriding defaultTtl with explicit TTL", async () => {
+      const ttlCache = createTestCache("default-ttl-override", { defaultTtl: 5000 });
+      await ttlCache.set("key", "value", 1000);
+
+      const ttl = await ttlCache.pttl("key");
+      expect(ttl).toBeGreaterThan(900);
+      expect(ttl).toBeLessThanOrEqual(1000);
+
+      await ttlCache.close();
+    });
+
+    it("should allow disabling TTL with 0", async () => {
+      const ttlCache = createTestCache("default-ttl-disable", { defaultTtl: 5000 });
+      await ttlCache.set("key", "value", 0);
+
+      expect(await ttlCache.pttl("key")).toBe(-1);
+
+      await ttlCache.close();
+    });
+
+    it("should apply defaultTtl to setnx", async () => {
+      const ttlCache = createTestCache("default-ttl-setnx", { defaultTtl: 5000 });
+      await ttlCache.setnx("key", "value");
+
+      const ttl = await ttlCache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+
+      await ttlCache.close();
+    });
+
+    it("should apply defaultTtl to getOrSet", async () => {
+      const ttlCache = createTestCache("default-ttl-getorset", { defaultTtl: 5000 });
+      await ttlCache.getOrSet("key", () => "value");
+
+      const ttl = await ttlCache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+
+      await ttlCache.close();
+    });
+
+    it("should apply defaultTtl to mset", async () => {
+      const ttlCache = createTestCache("default-ttl-mset", { defaultTtl: 5000 });
+      await ttlCache.mset([
+        ["a", 1],
+        ["b", 2],
+      ]);
+
+      expect(await ttlCache.pttl("a")).toBeGreaterThan(4000);
+      expect(await ttlCache.pttl("b")).toBeGreaterThan(4000);
+
+      await ttlCache.close();
+    });
+
+    it("should expire items with defaultTtl", async () => {
+      const ttlCache = createTestCache("default-ttl-expire", { defaultTtl: 50 });
+      await ttlCache.set("key", "value");
+
+      expect(await ttlCache.get("key")).toBe("value");
+      await delay(60);
+      expect(await ttlCache.get("key")).toBeNull();
+
+      await ttlCache.close();
+    });
+  });
+
+  describe("namespace", () => {
+    it("should prefix keys with namespace", async () => {
+      const nsCache = createTestCache("namespace", { namespace: "myapp" });
+      await nsCache.set("key", "value");
+
+      // Key should be accessible via the cache
+      expect(await nsCache.get("key")).toBe("value");
+
+      await nsCache.close();
+
+      // Verify the key is actually stored with prefix by using a different cache
+      const rawCache = createTestCache("namespace");
+      expect(await rawCache.get("myapp:key")).toBe("value");
+      expect(await rawCache.get("key")).toBeNull();
+
+      await rawCache.close();
+    });
+
+    it("should return unprefixed keys from keys()", async () => {
+      const nsCache = createTestCache("namespace-keys", { namespace: "app" });
+      await nsCache.set("user:1", "Alice");
+      await nsCache.set("user:2", "Bob");
+
+      const keys = await nsCache.keys();
+      expect(keys.sort()).toEqual(["user:1", "user:2"]);
+
+      await nsCache.close();
+    });
+
+    it("should support pattern matching with namespace", async () => {
+      const nsCache = createTestCache("namespace-pattern", { namespace: "app" });
+      await nsCache.set("user:1", "Alice");
+      await nsCache.set("user:2", "Bob");
+      await nsCache.set("post:1", "Hello");
+
+      const userKeys = await nsCache.keys("user:*");
+      expect(userKeys.sort()).toEqual(["user:1", "user:2"]);
+
+      await nsCache.close();
+    });
+
+    it("should isolate namespaces", async () => {
+      const cache1 = createTestCache("namespace-isolate", { namespace: "app1" });
+      const cache2 = createTestCache("namespace-isolate", { namespace: "app2" });
+
+      await cache1.set("key", "value1");
+      await cache2.set("key", "value2");
+
+      expect(await cache1.get("key")).toBe("value1");
+      expect(await cache2.get("key")).toBe("value2");
+
+      await cache1.close();
+      await cache2.close();
+    });
+
+    it("should work with del", async () => {
+      const nsCache = createTestCache("namespace-del", { namespace: "app" });
+      await nsCache.set("key", "value");
+      expect(await nsCache.del("key")).toBe(true);
+      expect(await nsCache.get("key")).toBeNull();
+
+      await nsCache.close();
+    });
+
+    it("should work with exists", async () => {
+      const nsCache = createTestCache("namespace-exists", { namespace: "app" });
+      await nsCache.set("key", "value");
+      expect(await nsCache.exists("key")).toBe(true);
+      expect(await nsCache.exists("other")).toBe(false);
+
+      await nsCache.close();
+    });
+
+    it("should work with TTL operations", async () => {
+      const nsCache = createTestCache("namespace-ttl", { namespace: "app" });
+      await nsCache.set("key", "value");
+
+      await nsCache.pexpire("key", 5000);
+      expect(await nsCache.pttl("key")).toBeGreaterThan(4000);
+
+      await nsCache.persist("key");
+      expect(await nsCache.pttl("key")).toBe(-1);
+
+      await nsCache.close();
+    });
+
+    it("should work with touch", async () => {
+      const nsCache = createTestCache("namespace-touch", { namespace: "app" });
+      await nsCache.set("key", "value");
+
+      expect(await nsCache.touch("key", 5000)).toBe(true);
+      expect(await nsCache.pttl("key")).toBeGreaterThan(4000);
+
+      await nsCache.close();
+    });
+
+    it("should work with mget and mset", async () => {
+      const nsCache = createTestCache("namespace-multi", { namespace: "app" });
+      await nsCache.mset([
+        ["a", 1],
+        ["b", 2],
+      ]);
+
+      const values = await nsCache.mget(["a", "b", "c"]);
+      expect(values).toEqual([1, 2, null]);
+
+      await nsCache.close();
+    });
+
+    it("should work with getOrSet", async () => {
+      const nsCache = createTestCache("namespace-getorset", { namespace: "app" });
+      const result = await nsCache.getOrSet("key", () => "computed");
+
+      expect(result).toBe("computed");
+      expect(await nsCache.get("key")).toBe("computed");
+
+      await nsCache.close();
+    });
+
+    it("should work with setnx", async () => {
+      const nsCache = createTestCache("namespace-setnx", { namespace: "app" });
+
+      expect(await nsCache.setnx("key", "value1")).toBe(true);
+      expect(await nsCache.setnx("key", "value2")).toBe(false);
+      expect(await nsCache.get("key")).toBe("value1");
+
+      await nsCache.close();
+    });
+
+    it("should combine with defaultTtl", async () => {
+      const combinedCache = createTestCache("namespace-defaultttl", {
+        namespace: "app",
+        defaultTtl: 5000,
+      });
+
+      await combinedCache.set("key", "value");
+      expect(await combinedCache.get("key")).toBe("value");
+      expect(await combinedCache.pttl("key")).toBeGreaterThan(4000);
+
+      await combinedCache.close();
     });
   });
 

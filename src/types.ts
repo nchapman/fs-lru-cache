@@ -18,6 +18,10 @@ export interface CacheOptions {
   maxDiskSize?: number;
   /** Number of shard directories (default: 16) */
   shards?: number;
+  /** Default TTL in milliseconds for all entries (default: none). Use 0 to explicitly disable TTL on a specific set(). */
+  defaultTtl?: number;
+  /** Namespace prefix for all keys (default: none). Keys are stored as `${namespace}:${key}`. */
+  namespace?: string;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -55,10 +59,12 @@ export interface CacheStats {
   };
 }
 
-export const DEFAULT_OPTIONS: Required<CacheOptions> = {
+export const DEFAULT_OPTIONS = {
   dir: ".cache",
   maxMemoryItems: 1000,
   maxMemorySize: 50 * 1024 * 1024, // 50MB
   maxDiskSize: 500 * 1024 * 1024, // 500MB
   shards: 16,
+  defaultTtl: undefined as number | undefined,
+  namespace: undefined as string | undefined,
 };

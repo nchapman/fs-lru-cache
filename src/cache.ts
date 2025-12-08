@@ -18,6 +18,8 @@ export class FsLruCache {
   private readonly memory: MemoryStore;
   private readonly files: FileStore;
   private readonly maxMemorySize: number;
+  private readonly defaultTtl?: number;
+  private readonly namespace?: string;
   private hits = 0;
   private misses = 0;
   private closed = false;
@@ -28,6 +30,8 @@ export class FsLruCache {
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
     this.maxMemorySize = opts.maxMemorySize;
+    this.defaultTtl = opts.defaultTtl;
+    this.namespace = opts.namespace;
 
     this.memory = new MemoryStore({
       maxItems: opts.maxMemoryItems,
@@ -39,6 +43,36 @@ export class FsLruCache {
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
     });
+  }
+
+  /**
+   * Prefix a key with the namespace if configured.
+   */
+  private prefixKey(key: string): string {
+    return this.namespace ? `${this.namespace}:${key}` : key;
+  }
+
+  /**
+   * Remove the namespace prefix from a key.
+   */
+  private unprefixKey(key: string): string {
+    if (this.namespace && key.startsWith(`${this.namespace}:`)) {
+      return key.slice(this.namespace.length + 1);
+    }
+    return key;
+  }
+
+  /**
+   * Resolve the TTL to use: explicit value, defaultTtl, or none.
+   * - undefined: use defaultTtl if set
+   * - 0: explicitly no TTL
+   * - positive number: use that TTL
+   */
+  private resolveTtl(ttlMs?: number): number | undefined {
+    if (ttlMs === undefined) {
+      return this.defaultTtl;
+    }
+    return ttlMs === 0 ? undefined : ttlMs;
   }
 
   private assertOpen(): void {
@@ -73,21 +107,22 @@ export class FsLruCache {
    */
   async get<T = unknown>(key: string): Promise<T | null> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
 
     // Check memory first
-    const memValue = this.memory.get<T>(key);
+    const memValue = this.memory.get<T>(prefixedKey);
     if (memValue !== null) {
       this.hits++;
       return memValue;
     }
 
     // Check disk
-    const diskEntry = await this.files.get<T>(key);
+    const diskEntry = await this.files.get<T>(prefixedKey);
     if (diskEntry !== null) {
       this.hits++;
       // Promote to memory if it fits
       if (estimateSize(diskEntry.value) <= this.maxMemorySize) {
-        this.memory.set(key, diskEntry.value, diskEntry.expiresAt);
+        this.memory.set(prefixedKey, diskEntry.value, diskEntry.expiresAt);
       }
       return diskEntry.value;
     }
@@ -100,24 +135,26 @@ export class FsLruCache {
    * Set a value in the cache.
    * @param key The cache key
    * @param value The value to store (must be JSON-serializable)
-   * @param ttlMs Optional TTL in milliseconds
+   * @param ttlMs Optional TTL in milliseconds (0 to explicitly disable defaultTtl)
    */
   async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
+    const resolvedTtl = this.resolveTtl(ttlMs);
 
-    const expiresAt = ttlMs ? Date.now() + ttlMs : null;
+    const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 
     // Serialize once for both stores
-    const entry: CacheEntry = { key, value, expiresAt };
+    const entry: CacheEntry = { key: prefixedKey, value, expiresAt };
     const serialized = JSON.stringify(entry);
     const size = Buffer.byteLength(serialized, "utf8");
 
     // Write to disk first (ensures durability before memory)
-    await this.files.set(key, value, expiresAt, serialized);
+    await this.files.set(prefixedKey, value, expiresAt, serialized);
 
     // Write to memory if it fits
     if (size <= this.maxMemorySize) {
-      this.memory.set(key, value, expiresAt);
+      this.memory.set(prefixedKey, value, expiresAt);
     }
   }
 
@@ -127,15 +164,16 @@ export class FsLruCache {
    */
   async setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
 
     // Check if already in flight - if so, wait and report not set
-    const existing = this.inFlight.get(key);
+    const existing = this.inFlight.get(prefixedKey);
     if (existing) {
       await existing;
       return false;
     }
 
-    return this.withStampedeProtection(key, async () => {
+    return this.withStampedeProtection(prefixedKey, async () => {
       if (await this.exists(key)) {
         return false;
       }
@@ -149,8 +187,9 @@ export class FsLruCache {
    */
   async del(key: string): Promise<boolean> {
     this.assertOpen();
-    const memDeleted = this.memory.delete(key);
-    const diskDeleted = await this.files.delete(key);
+    const prefixedKey = this.prefixKey(key);
+    const memDeleted = this.memory.delete(prefixedKey);
+    const diskDeleted = await this.files.delete(prefixedKey);
     return memDeleted || diskDeleted;
   }
 
@@ -159,7 +198,8 @@ export class FsLruCache {
    */
   async exists(key: string): Promise<boolean> {
     this.assertOpen();
-    return this.memory.has(key) || (await this.files.has(key));
+    const prefixedKey = this.prefixKey(key);
+    return this.memory.has(prefixedKey) || (await this.files.has(prefixedKey));
   }
 
   /**
@@ -169,12 +209,17 @@ export class FsLruCache {
   async keys(pattern = "*"): Promise<string[]> {
     this.assertOpen();
 
+    // Prefix the pattern for internal lookup
+    const prefixedPattern = this.prefixKey(pattern);
+
     const [memKeys, diskKeys] = await Promise.all([
-      Promise.resolve(this.memory.keys(pattern)),
-      this.files.keys(pattern),
+      Promise.resolve(this.memory.keys(prefixedPattern)),
+      this.files.keys(prefixedPattern),
     ]);
 
-    return [...new Set([...memKeys, ...diskKeys])];
+    // Remove prefix from returned keys
+    const allKeys = [...new Set([...memKeys, ...diskKeys])];
+    return allKeys.map((k) => this.unprefixKey(k));
   }
 
   /**
@@ -189,10 +234,11 @@ export class FsLruCache {
    */
   async pexpire(key: string, ms: number): Promise<boolean> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
     const expiresAt = Date.now() + ms;
 
-    const memSuccess = this.memory.setExpiry(key, expiresAt);
-    const diskSuccess = await this.files.setExpiry(key, expiresAt);
+    const memSuccess = this.memory.setExpiry(prefixedKey, expiresAt);
+    const diskSuccess = await this.files.setExpiry(prefixedKey, expiresAt);
 
     return memSuccess || diskSuccess;
   }
@@ -203,9 +249,29 @@ export class FsLruCache {
    */
   async persist(key: string): Promise<boolean> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
 
-    const memSuccess = this.memory.setExpiry(key, null);
-    const diskSuccess = await this.files.setExpiry(key, null);
+    const memSuccess = this.memory.setExpiry(prefixedKey, null);
+    const diskSuccess = await this.files.setExpiry(prefixedKey, null);
+
+    return memSuccess || diskSuccess;
+  }
+
+  /**
+   * Touch a key: refresh its position in the LRU and optionally update TTL.
+   * This is more efficient than get() when you don't need the value.
+   * @param key The cache key
+   * @param ttlMs Optional new TTL in milliseconds
+   * @returns true if key exists, false otherwise
+   */
+  async touch(key: string, ttlMs?: number): Promise<boolean> {
+    this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
+
+    const expiresAt = ttlMs !== undefined ? Date.now() + ttlMs : undefined;
+
+    const memSuccess = this.memory.touch(prefixedKey, expiresAt);
+    const diskSuccess = await this.files.touch(prefixedKey, expiresAt);
 
     return memSuccess || diskSuccess;
   }
@@ -225,12 +291,13 @@ export class FsLruCache {
    */
   async pttl(key: string): Promise<number> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
 
-    const memTtl = this.memory.getTtl(key);
+    const memTtl = this.memory.getTtl(prefixedKey);
     if (memTtl !== -2) {
       return memTtl;
     }
-    return this.files.getTtl(key);
+    return this.files.getTtl(prefixedKey);
   }
 
   /**
@@ -260,6 +327,7 @@ export class FsLruCache {
    */
   async getOrSet<T>(key: string, fn: () => T | Promise<T>, ttlMs?: number): Promise<T> {
     this.assertOpen();
+    const prefixedKey = this.prefixKey(key);
 
     // Fast path: check cache first
     const cached = await this.get<T>(key);
@@ -267,7 +335,7 @@ export class FsLruCache {
       return cached;
     }
 
-    return this.withStampedeProtection(key, async () => {
+    return this.withStampedeProtection(prefixedKey, async () => {
       // Double-check after acquiring "lock"
       const recheck = await this.get<T>(key);
       if (recheck !== null) {
@@ -278,6 +346,15 @@ export class FsLruCache {
       await this.set(key, value, ttlMs);
       return value;
     });
+  }
+
+  /**
+   * Get the total number of items in the cache.
+   * This is the count of items on disk (source of truth).
+   */
+  async size(): Promise<number> {
+    this.assertOpen();
+    return this.files.getItemCount();
   }
 
   /**
