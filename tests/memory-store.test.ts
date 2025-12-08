@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MemoryStore } from '../src/memory-store.js';
+import { delay } from './test-utils.js';
 
 describe('MemoryStore', () => {
   let store: MemoryStore;
@@ -75,7 +76,7 @@ describe('MemoryStore', () => {
       store.set('key', 'value', Date.now() + 50);
       expect(store.get('key')).toBe('value');
 
-      await new Promise((r) => setTimeout(r, 60));
+      await delay(60);
       expect(store.get('key')).toBeNull();
     });
 
@@ -98,10 +99,8 @@ describe('MemoryStore', () => {
 
     it('should allow updating expiry', () => {
       store.set('key', 'value', Date.now() + 1000);
-      const newExpiry = Date.now() + 5000;
-      store.setExpiry('key', newExpiry);
-      const ttl = store.getTtl('key');
-      expect(ttl).toBeGreaterThan(4000);
+      store.setExpiry('key', Date.now() + 5000);
+      expect(store.getTtl('key')).toBeGreaterThan(4000);
     });
   });
 
@@ -127,16 +126,27 @@ describe('MemoryStore', () => {
       smallStore.set('b', 2);
       smallStore.set('c', 3);
 
-      // Access 'a' to promote it
-      smallStore.get('a');
+      smallStore.get('a'); // Promote 'a'
+      smallStore.set('d', 4); // Evicts 'b' (oldest)
 
-      // Now add 'd' - should evict 'b' (oldest)
-      smallStore.set('d', 4);
-
-      expect(smallStore.get('a')).toBe(1); // promoted, still exists
-      expect(smallStore.get('b')).toBeNull(); // evicted
+      expect(smallStore.get('a')).toBe(1);
+      expect(smallStore.get('b')).toBeNull();
       expect(smallStore.get('c')).toBe(3);
       expect(smallStore.get('d')).toBe(4);
+    });
+
+    it('should evict expired entries before LRU entries', async () => {
+      const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
+
+      smallStore.set('expiring', 'value', Date.now() + 50);
+      smallStore.set('permanent1', 'value');
+      smallStore.set('permanent2', 'value');
+
+      await delay(60);
+      smallStore.set('new', 'value');
+
+      expect(smallStore.get('expiring')).toBeNull();
+      expect(smallStore.get('permanent1')).toBe('value');
     });
   });
 
@@ -144,14 +154,12 @@ describe('MemoryStore', () => {
     it('should evict when size exceeded', () => {
       const smallStore = new MemoryStore({ maxItems: 1000, maxSize: 100 });
 
-      // Each string is roughly 10-20 bytes in JSON
       smallStore.set('a', 'aaaaaaaaaa');
       smallStore.set('b', 'bbbbbbbbbb');
       smallStore.set('c', 'cccccccccc');
       smallStore.set('d', 'dddddddddd');
       smallStore.set('e', 'eeeeeeeeee');
 
-      // Some items should have been evicted
       expect(smallStore.stats.size).toBeLessThanOrEqual(100);
     });
   });
@@ -175,14 +183,10 @@ describe('MemoryStore', () => {
       smallStore.set('b', 2);
       smallStore.set('c', 3);
 
-      // Peek 'a' - should not promote it
-      const entry = smallStore.peek('a');
-      expect(entry?.value).toBe(1);
+      expect(smallStore.peek('a')?.value).toBe(1);
+      smallStore.set('d', 4); // Evicts 'a' since peek didn't promote it
 
-      // Add 'd' - should evict 'a' since peek didn't promote it
-      smallStore.set('d', 4);
-
-      expect(smallStore.get('a')).toBeNull(); // evicted
+      expect(smallStore.get('a')).toBeNull();
       expect(smallStore.get('b')).toBe(2);
     });
 
@@ -192,31 +196,8 @@ describe('MemoryStore', () => {
 
     it('should return null for expired keys', async () => {
       store.set('key', 'value', Date.now() + 50);
-      await new Promise((r) => setTimeout(r, 60));
-
+      await delay(60);
       expect(store.peek('key')).toBeNull();
-    });
-  });
-
-  describe('LRU eviction with expired entries', () => {
-    it('should evict expired entries before LRU entries', async () => {
-      const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
-
-      // Add entry with TTL
-      smallStore.set('expiring', 'value', Date.now() + 50);
-      smallStore.set('permanent1', 'value');
-      smallStore.set('permanent2', 'value');
-
-      // Wait for expiration
-      await new Promise((r) => setTimeout(r, 60));
-
-      // Add new entry - should evict expired one first
-      smallStore.set('new', 'value');
-
-      // Expired entry should be gone
-      expect(smallStore.get('expiring')).toBeNull();
-      // permanent1 should still exist (wasn't evicted because expired was evicted first)
-      expect(smallStore.get('permanent1')).toBe('value');
     });
   });
 
@@ -225,10 +206,8 @@ describe('MemoryStore', () => {
       store.set('key', 'value', Date.now() + 50);
       expect(store.has('key')).toBe(true);
 
-      await new Promise((r) => setTimeout(r, 60));
-
+      await delay(60);
       expect(store.has('key')).toBe(false);
-      // Entry should be cleaned up
       expect(store.stats.items).toBe(0);
     });
   });
@@ -240,8 +219,7 @@ describe('MemoryStore', () => {
 
     it('should return false for expired keys', async () => {
       store.set('key', 'value', Date.now() + 50);
-      await new Promise((r) => setTimeout(r, 60));
-
+      await delay(60);
       expect(store.setExpiry('key', Date.now() + 1000)).toBe(false);
     });
 
@@ -261,8 +239,7 @@ describe('MemoryStore', () => {
 
       expect(store.keys().sort()).toEqual(['expiring', 'permanent']);
 
-      await new Promise((r) => setTimeout(r, 60));
-
+      await delay(60);
       expect(store.keys()).toEqual(['permanent']);
       expect(store.stats.items).toBe(1);
     });
