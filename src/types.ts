@@ -1,0 +1,34 @@
+export interface CacheOptions {
+  /** Cache directory path (default: ./.cache) */
+  dir?: string;
+  /** Maximum number of items in memory (default: 1000) */
+  maxMemoryItems?: number;
+  /** Maximum memory usage in bytes (default: 50MB) */
+  maxMemorySize?: number;
+  /** Maximum disk usage in bytes (default: 500MB) */
+  maxDiskSize?: number;
+  /** Number of shard directories (default: 16) */
+  shards?: number;
+}
+
+export interface CacheEntry<T = unknown> {
+  /** The cache key */
+  key: string;
+  /** The stored value */
+  value: T;
+  /** Expiration timestamp in ms, or null if no expiry */
+  expiresAt: number | null;
+}
+
+export interface MemoryEntry<T = unknown> extends CacheEntry<T> {
+  /** Size in bytes (approximate) */
+  size: number;
+}
+
+export const DEFAULT_OPTIONS: Required<CacheOptions> = {
+  dir: '.cache',
+  maxMemoryItems: 1000,
+  maxMemorySize: 50 * 1024 * 1024, // 50MB
+  maxDiskSize: 500 * 1024 * 1024, // 500MB
+  shards: 16,
+};
