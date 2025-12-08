@@ -21,7 +21,7 @@ async function cleanup() {
 async function runBench(
   name: string,
   iterations: number,
-  fn: () => Promise<void>
+  fn: () => Promise<void>,
 ): Promise<BenchResult> {
   const times: number[] = [];
 
@@ -167,28 +167,24 @@ async function benchmarkGetOrSet() {
 
   // Concurrent requests (stampede)
   let concurrentIdx = 0;
-  const gosConcurrent = await runBench(
-    "getOrSet() - 10 concurrent same key",
-    100,
-    async () => {
-      const key = `concurrent:${concurrentIdx++}`;
-      let computeCount = 0;
-      await Promise.all(
-        Array(10)
-          .fill(null)
-          .map(() =>
-            cache.getOrSet(key, async () => {
-              computeCount++;
-              await new Promise((r) => setTimeout(r, 1));
-              return { computed: true };
-            })
-          )
-      );
-      if (computeCount > 1) {
-        console.warn(`  Warning: Key ${key} computed ${computeCount} times (expected 1)`);
-      }
+  const gosConcurrent = await runBench("getOrSet() - 10 concurrent same key", 100, async () => {
+    const key = `concurrent:${concurrentIdx++}`;
+    let computeCount = 0;
+    await Promise.all(
+      Array(10)
+        .fill(null)
+        .map(() =>
+          cache.getOrSet(key, async () => {
+            computeCount++;
+            await new Promise((r) => setTimeout(r, 1));
+            return { computed: true };
+          }),
+        ),
+    );
+    if (computeCount > 1) {
+      console.warn(`  Warning: Key ${key} computed ${computeCount} times (expected 1)`);
     }
-  );
+  });
   console.log(formatResult(gosConcurrent));
 
   await cache.close();
@@ -272,7 +268,7 @@ async function benchmarkCompression() {
   const gzipStats = await withGzip.stats();
   console.log(`  Disk size (gzip): ${(gzipStats.disk.size / 1024).toFixed(1)} KB`);
   console.log(
-    `  Compression ratio: ${((1 - gzipStats.disk.size / noGzipStats.disk.size) * 100).toFixed(1)}% smaller`
+    `  Compression ratio: ${((1 - gzipStats.disk.size / noGzipStats.disk.size) * 100).toFixed(1)}% smaller`,
   );
   await withGzip.close();
 }
@@ -296,7 +292,7 @@ async function benchmarkEviction() {
     1000,
     async () => {
       await cache.set(`evict:${evictIdx++}`, value);
-    }
+    },
   );
   console.log(formatResult(setWithEviction));
 

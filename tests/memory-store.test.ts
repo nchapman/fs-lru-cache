@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { MemoryStore } from "../src/memory-store.js";
 import { delay } from "./test-utils.js";
 
+// Helper to serialize values for the store
+const serialize = (value: unknown) => JSON.stringify(value);
+
 describe("MemoryStore", () => {
   let store: MemoryStore;
 
@@ -11,8 +14,8 @@ describe("MemoryStore", () => {
 
   describe("get/set", () => {
     it("should store and retrieve values", () => {
-      store.set("key1", "value1");
-      expect(store.get("key1")).toBe("value1");
+      store.set("key1", serialize("value1"));
+      expect(store.get("key1")).toBe(serialize("value1"));
     });
 
     it("should return null for non-existent keys", () => {
@@ -21,20 +24,20 @@ describe("MemoryStore", () => {
 
     it("should store complex objects", () => {
       const obj = { name: "test", nested: { value: 123 } };
-      store.set("obj", obj);
-      expect(store.get("obj")).toEqual(obj);
+      store.set("obj", serialize(obj));
+      expect(JSON.parse(store.get("obj")!)).toEqual(obj);
     });
 
     it("should overwrite existing values", () => {
-      store.set("key", "value1");
-      store.set("key", "value2");
-      expect(store.get("key")).toBe("value2");
+      store.set("key", serialize("value1"));
+      store.set("key", serialize("value2"));
+      expect(store.get("key")).toBe(serialize("value2"));
     });
   });
 
   describe("delete", () => {
     it("should delete existing keys", () => {
-      store.set("key", "value");
+      store.set("key", serialize("value"));
       expect(store.delete("key")).toBe(true);
       expect(store.get("key")).toBeNull();
     });
@@ -46,7 +49,7 @@ describe("MemoryStore", () => {
 
   describe("has", () => {
     it("should return true for existing keys", () => {
-      store.set("key", "value");
+      store.set("key", serialize("value"));
       expect(store.has("key")).toBe(true);
     });
 
@@ -57,24 +60,24 @@ describe("MemoryStore", () => {
 
   describe("keys", () => {
     it("should return all keys", () => {
-      store.set("a", 1);
-      store.set("b", 2);
-      store.set("c", 3);
+      store.set("a", serialize(1));
+      store.set("b", serialize(2));
+      store.set("c", serialize(3));
       expect(store.keys()).toEqual(["a", "b", "c"]);
     });
 
     it("should support wildcard pattern", () => {
-      store.set("user:1", { id: 1 });
-      store.set("user:2", { id: 2 });
-      store.set("post:1", { id: 1 });
+      store.set("user:1", serialize({ id: 1 }));
+      store.set("user:2", serialize({ id: 2 }));
+      store.set("post:1", serialize({ id: 1 }));
       expect(store.keys("user:*")).toEqual(["user:1", "user:2"]);
     });
   });
 
   describe("TTL", () => {
     it("should expire keys after TTL", async () => {
-      store.set("key", "value", Date.now() + 50);
-      expect(store.get("key")).toBe("value");
+      store.set("key", serialize("value"), Date.now() + 50);
+      expect(store.get("key")).toBe(serialize("value"));
 
       await delay(60);
       expect(store.get("key")).toBeNull();
@@ -82,14 +85,14 @@ describe("MemoryStore", () => {
 
     it("should return correct TTL", () => {
       const expiresAt = Date.now() + 1000;
-      store.set("key", "value", expiresAt);
+      store.set("key", serialize("value"), expiresAt);
       const ttl = store.getTtl("key");
       expect(ttl).toBeGreaterThan(900);
       expect(ttl).toBeLessThanOrEqual(1000);
     });
 
     it("should return -1 for keys without expiry", () => {
-      store.set("key", "value");
+      store.set("key", serialize("value"));
       expect(store.getTtl("key")).toBe(-1);
     });
 
@@ -98,7 +101,7 @@ describe("MemoryStore", () => {
     });
 
     it("should allow updating expiry", () => {
-      store.set("key", "value", Date.now() + 1000);
+      store.set("key", serialize("value"), Date.now() + 1000);
       store.setExpiry("key", Date.now() + 5000);
       expect(store.getTtl("key")).toBeGreaterThan(4000);
     });
@@ -108,45 +111,45 @@ describe("MemoryStore", () => {
     it("should evict oldest items when max items exceeded", () => {
       const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
 
-      smallStore.set("a", 1);
-      smallStore.set("b", 2);
-      smallStore.set("c", 3);
-      smallStore.set("d", 4);
+      smallStore.set("a", serialize(1));
+      smallStore.set("b", serialize(2));
+      smallStore.set("c", serialize(3));
+      smallStore.set("d", serialize(4));
 
       expect(smallStore.get("a")).toBeNull(); // evicted
-      expect(smallStore.get("b")).toBe(2);
-      expect(smallStore.get("c")).toBe(3);
-      expect(smallStore.get("d")).toBe(4);
+      expect(JSON.parse(smallStore.get("b")!)).toBe(2);
+      expect(JSON.parse(smallStore.get("c")!)).toBe(3);
+      expect(JSON.parse(smallStore.get("d")!)).toBe(4);
     });
 
     it("should promote accessed items to most recent", () => {
       const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
 
-      smallStore.set("a", 1);
-      smallStore.set("b", 2);
-      smallStore.set("c", 3);
+      smallStore.set("a", serialize(1));
+      smallStore.set("b", serialize(2));
+      smallStore.set("c", serialize(3));
 
       smallStore.get("a"); // Promote 'a'
-      smallStore.set("d", 4); // Evicts 'b' (oldest)
+      smallStore.set("d", serialize(4)); // Evicts 'b' (oldest)
 
-      expect(smallStore.get("a")).toBe(1);
+      expect(JSON.parse(smallStore.get("a")!)).toBe(1);
       expect(smallStore.get("b")).toBeNull();
-      expect(smallStore.get("c")).toBe(3);
-      expect(smallStore.get("d")).toBe(4);
+      expect(JSON.parse(smallStore.get("c")!)).toBe(3);
+      expect(JSON.parse(smallStore.get("d")!)).toBe(4);
     });
 
     it("should evict expired entries before LRU entries", async () => {
       const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
 
-      smallStore.set("expiring", "value", Date.now() + 50);
-      smallStore.set("permanent1", "value");
-      smallStore.set("permanent2", "value");
+      smallStore.set("expiring", serialize("value"), Date.now() + 50);
+      smallStore.set("permanent1", serialize("value"));
+      smallStore.set("permanent2", serialize("value"));
 
       await delay(60);
-      smallStore.set("new", "value");
+      smallStore.set("new", serialize("value"));
 
       expect(smallStore.get("expiring")).toBeNull();
-      expect(smallStore.get("permanent1")).toBe("value");
+      expect(smallStore.get("permanent1")).toBe(serialize("value"));
     });
   });
 
@@ -154,11 +157,11 @@ describe("MemoryStore", () => {
     it("should evict when size exceeded", () => {
       const smallStore = new MemoryStore({ maxItems: 1000, maxSize: 100 });
 
-      smallStore.set("a", "aaaaaaaaaa");
-      smallStore.set("b", "bbbbbbbbbb");
-      smallStore.set("c", "cccccccccc");
-      smallStore.set("d", "dddddddddd");
-      smallStore.set("e", "eeeeeeeeee");
+      smallStore.set("a", serialize("aaaaaaaaaa"));
+      smallStore.set("b", serialize("bbbbbbbbbb"));
+      smallStore.set("c", serialize("cccccccccc"));
+      smallStore.set("d", serialize("dddddddddd"));
+      smallStore.set("e", serialize("eeeeeeeeee"));
 
       expect(smallStore.stats.size).toBeLessThanOrEqual(100);
     });
@@ -166,8 +169,8 @@ describe("MemoryStore", () => {
 
   describe("clear", () => {
     it("should remove all items", () => {
-      store.set("a", 1);
-      store.set("b", 2);
+      store.set("a", serialize(1));
+      store.set("b", serialize(2));
       store.clear();
       expect(store.keys()).toEqual([]);
       expect(store.stats.items).toBe(0);
@@ -179,15 +182,15 @@ describe("MemoryStore", () => {
     it("should return entry without promoting to MRU", () => {
       const smallStore = new MemoryStore({ maxItems: 3, maxSize: 1024 * 1024 });
 
-      smallStore.set("a", 1);
-      smallStore.set("b", 2);
-      smallStore.set("c", 3);
+      smallStore.set("a", serialize(1));
+      smallStore.set("b", serialize(2));
+      smallStore.set("c", serialize(3));
 
-      expect(smallStore.peek("a")?.value).toBe(1);
-      smallStore.set("d", 4); // Evicts 'a' since peek didn't promote it
+      expect(JSON.parse(smallStore.peek("a")!.serialized)).toBe(1);
+      smallStore.set("d", serialize(4)); // Evicts 'a' since peek didn't promote it
 
       expect(smallStore.get("a")).toBeNull();
-      expect(smallStore.get("b")).toBe(2);
+      expect(JSON.parse(smallStore.get("b")!)).toBe(2);
     });
 
     it("should return null for non-existent keys", () => {
@@ -195,7 +198,7 @@ describe("MemoryStore", () => {
     });
 
     it("should return null for expired keys", async () => {
-      store.set("key", "value", Date.now() + 50);
+      store.set("key", serialize("value"), Date.now() + 50);
       await delay(60);
       expect(store.peek("key")).toBeNull();
     });
@@ -203,7 +206,7 @@ describe("MemoryStore", () => {
 
   describe("has with expired entries", () => {
     it("should return false and clean up expired entries", async () => {
-      store.set("key", "value", Date.now() + 50);
+      store.set("key", serialize("value"), Date.now() + 50);
       expect(store.has("key")).toBe(true);
 
       await delay(60);
@@ -218,13 +221,13 @@ describe("MemoryStore", () => {
     });
 
     it("should return false for expired keys", async () => {
-      store.set("key", "value", Date.now() + 50);
+      store.set("key", serialize("value"), Date.now() + 50);
       await delay(60);
       expect(store.setExpiry("key", Date.now() + 1000)).toBe(false);
     });
 
     it("should allow removing expiry", () => {
-      store.set("key", "value", Date.now() + 1000);
+      store.set("key", serialize("value"), Date.now() + 1000);
       expect(store.getTtl("key")).toBeGreaterThan(0);
 
       store.setExpiry("key", null);
@@ -234,8 +237,8 @@ describe("MemoryStore", () => {
 
   describe("keys with expired entries", () => {
     it("should clean up expired entries when listing keys", async () => {
-      store.set("expiring", "value", Date.now() + 50);
-      store.set("permanent", "value");
+      store.set("expiring", serialize("value"), Date.now() + 50);
+      store.set("permanent", serialize("value"));
 
       expect(store.keys().sort()).toEqual(["expiring", "permanent"]);
 

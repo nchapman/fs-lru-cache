@@ -1,5 +1,5 @@
 import { MemoryEntry } from "./types.js";
-import { estimateSize, isExpired, compilePattern, matchPattern } from "./utils.js";
+import { isExpired, compilePattern, matchPattern } from "./utils.js";
 
 export interface MemoryStoreOptions {
   maxItems: number;
@@ -36,17 +36,18 @@ export class MemoryStore {
   }
 
   /**
-   * Get a value from the cache.
+   * Get a serialized value from the cache.
    * Promotes the key to most recently used on access.
+   * @returns The JSON-serialized value string, or null if not found
    */
-  get<T = unknown>(key: string): T | null {
+  get(key: string): string | null {
     const entry = this.getValidEntry(key);
     if (!entry) return null;
 
     // Promote to most recently used by re-inserting
     this.cache.delete(key);
     this.cache.set(key, entry);
-    return entry.value as T;
+    return entry.serialized;
   }
 
   /**
@@ -57,15 +58,18 @@ export class MemoryStore {
   }
 
   /**
-   * Set a value in the cache
+   * Set a serialized value in the cache
+   * @param key The cache key
+   * @param serialized The JSON-serialized value string
+   * @param expiresAt Expiration timestamp or null
    */
-  set<T = unknown>(key: string, value: T, expiresAt: number | null = null): void {
+  set(key: string, serialized: string, expiresAt: number | null = null): void {
     if (this.cache.has(key)) {
       this.delete(key);
     }
 
-    const size = estimateSize(value);
-    const entry: MemoryEntry<T> = { key, value, expiresAt, size };
+    const size = Buffer.byteLength(serialized, "utf8");
+    const entry: MemoryEntry = { key, serialized, expiresAt, size };
 
     // Evict until we have space
     while (this.needsEviction(size)) {

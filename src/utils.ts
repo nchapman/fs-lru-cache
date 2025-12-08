@@ -24,13 +24,6 @@ export function getShardName(index: number): string {
 }
 
 /**
- * Estimate byte size of a JSON-serializable value
- */
-export function estimateSize(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), "utf8");
-}
-
-/**
  * Check if a cache entry has expired
  */
 export function isExpired(expiresAt: number | null): boolean {

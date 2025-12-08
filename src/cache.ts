@@ -1,7 +1,6 @@
 import { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from "./types.js";
 import { MemoryStore } from "./memory-store.js";
 import { FileStore } from "./file-store.js";
-import { estimateSize } from "./utils.js";
 
 /**
  * FsLruCache - An LRU cache with file system persistence.
@@ -122,11 +121,11 @@ export class FsLruCache {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
-    // Check memory first
-    const memValue = this.memory.get<T>(prefixedKey);
-    if (memValue !== null) {
+    // Check memory first (returns JSON string)
+    const memSerialized = this.memory.get(prefixedKey);
+    if (memSerialized !== null) {
       this.hits++;
-      return memValue;
+      return JSON.parse(memSerialized) as T;
     }
 
     // Check disk
@@ -134,8 +133,9 @@ export class FsLruCache {
     if (diskEntry !== null) {
       this.hits++;
       // Promote to memory if it fits
-      if (estimateSize(diskEntry.value) <= this.maxMemorySize) {
-        this.memory.set(prefixedKey, diskEntry.value, diskEntry.expiresAt);
+      const serialized = JSON.stringify(diskEntry.value);
+      if (Buffer.byteLength(serialized, "utf8") <= this.maxMemorySize) {
+        this.memory.set(prefixedKey, serialized, diskEntry.expiresAt);
       }
       return diskEntry.value;
     }
@@ -157,17 +157,20 @@ export class FsLruCache {
 
     const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 
-    // Serialize once for both stores
+    // Serialize value for memory store
+    const valueSerialized = JSON.stringify(value);
+    const valueSize = Buffer.byteLength(valueSerialized, "utf8");
+
+    // Serialize full entry for disk store
     const entry: CacheEntry = { key: prefixedKey, value, expiresAt };
-    const serialized = JSON.stringify(entry);
-    const size = Buffer.byteLength(serialized, "utf8");
+    const entrySerialized = JSON.stringify(entry);
 
     // Write to disk first (ensures durability before memory)
-    await this.files.set(prefixedKey, value, expiresAt, serialized);
+    await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
 
     // Write to memory if it fits
-    if (size <= this.maxMemorySize) {
-      this.memory.set(prefixedKey, value, expiresAt);
+    if (valueSize <= this.maxMemorySize) {
+      this.memory.set(prefixedKey, valueSerialized, expiresAt);
     }
   }
 

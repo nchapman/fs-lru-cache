@@ -37,8 +37,14 @@ export interface CacheEntry<T = unknown> {
   expiresAt: number | null;
 }
 
-export interface MemoryEntry<T = unknown> extends CacheEntry<T> {
-  /** Size in bytes (approximate) */
+export interface MemoryEntry {
+  /** The cache key */
+  key: string;
+  /** JSON-serialized value */
+  serialized: string;
+  /** Expiration timestamp in ms, or null if no expiry */
+  expiresAt: number | null;
+  /** Size in bytes */
   size: number;
 }
 
