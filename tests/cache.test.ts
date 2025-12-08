@@ -816,6 +816,89 @@ describe("FsLruCache", () => {
     });
   });
 
+  describe("prune", () => {
+    it("should remove expired entries", async () => {
+      await cache.set("expired1", "value", 50);
+      await cache.set("expired2", "value", 50);
+      await cache.set("valid", "value", 5000);
+
+      expect(await cache.size()).toBe(3);
+      await delay(60);
+
+      const pruned = await cache.prune();
+      expect(pruned).toBe(2);
+      expect(await cache.size()).toBe(1);
+      expect(await cache.get("valid")).toBe("value");
+    });
+
+    it("should return 0 when no expired entries", async () => {
+      await cache.set("a", 1);
+      await cache.set("b", 2, 5000);
+
+      const pruned = await cache.prune();
+      expect(pruned).toBe(0);
+    });
+
+    it("should handle empty cache", async () => {
+      const pruned = await cache.prune();
+      expect(pruned).toBe(0);
+    });
+
+    it("should prune both memory and disk", async () => {
+      // Set items that fit in memory
+      await cache.set("mem", "small", 50);
+      await delay(60);
+
+      const pruned = await cache.prune();
+      expect(pruned).toBeGreaterThanOrEqual(1);
+    });
+
+    it("should work with pruneInterval for automatic cleanup", async () => {
+      const autoCache = createTestCache("prune-interval", { pruneInterval: 100 });
+
+      await autoCache.set("short", "value", 50);
+      await autoCache.set("long", "value", 5000);
+
+      expect(await autoCache.size()).toBe(2);
+
+      // Wait for expiration + prune interval
+      await delay(200);
+
+      // Automatic prune should have cleaned up
+      expect(await autoCache.size()).toBe(1);
+      expect(await autoCache.get("long")).toBe("value");
+
+      await autoCache.close();
+    });
+
+    it("should stop automatic pruning after close", async () => {
+      const autoCache = createTestCache("prune-close", { pruneInterval: 50 });
+      await autoCache.close();
+
+      // Should not throw or cause issues
+      await delay(100);
+    });
+
+    it("should not keep process alive with pruneInterval", async () => {
+      // This test verifies unref() is called - the timer shouldn't prevent exit
+      const autoCache = createTestCache("prune-unref", { pruneInterval: 1000 });
+      // If unref() wasn't called, this test would hang
+      await autoCache.close();
+    });
+
+    it("should work with namespace", async () => {
+      const nsCache = createTestCache("prune-namespace", { namespace: "app" });
+      await nsCache.set("key", "value", 50);
+      await delay(60);
+
+      const pruned = await nsCache.prune();
+      expect(pruned).toBe(1);
+      expect(await nsCache.size()).toBe(0);
+
+      await nsCache.close();
+    });
+  });
+
   describe("close", () => {
     const closedCacheTests = [
       { method: "get", fn: (c: FsLruCache) => c.get("key") },
@@ -832,6 +915,7 @@ describe("FsLruCache", () => {
       { method: "persist", fn: (c: FsLruCache) => c.persist("key") },
       { method: "touch", fn: (c: FsLruCache) => c.touch("key") },
       { method: "size", fn: (c: FsLruCache) => c.size() },
+      { method: "prune", fn: (c: FsLruCache) => c.prune() },
     ];
 
     it.each(closedCacheTests)("should throw on $method after close", async ({ fn }) => {

@@ -163,6 +163,24 @@ export class MemoryStore {
   }
 
   /**
+   * Remove all expired entries from the cache.
+   * @returns Number of entries removed
+   */
+  prune(): number {
+    const now = Date.now();
+    let count = 0;
+
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt !== null && entry.expiresAt <= now) {
+        this.delete(key);
+        count++;
+      }
+    }
+
+    return count;
+  }
+
+  /**
    * Get current stats
    */
   get stats() {

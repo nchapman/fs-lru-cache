@@ -77,6 +77,7 @@ await cache.mset([
 await cache.setnx(key, value, ttlMs?)      // Set only if not exists
 await cache.getOrSet(key, fn, ttlMs?)      // Get or compute and cache
 await cache.touch(key, ttlMs?)             // Refresh LRU position, optionally update TTL
+await cache.prune()                        // Remove all expired entries
 await cache.size()                         // Get total number of items
 await cache.stats()                        // Get cache statistics
 cache.resetStats()                         // Reset hit/miss counters
@@ -95,6 +96,7 @@ const cache = new FsLruCache({
   defaultTtl: 300_000, // Default TTL in ms for all entries (default: none)
   namespace: "myapp", // Key prefix for multi-tenant apps (default: none)
   gzip: true, // Enable gzip compression for disk (default: false)
+  pruneInterval: 60000, // Auto-prune expired items every 60s (default: disabled)
 });
 ```
 
@@ -147,6 +149,18 @@ Features:
 - Seamless migration: enable compression anytime, old files still readable
 - Best for compressible data (text, JSON); less benefit for already-compressed data
 
+### Automatic Pruning
+
+By default, expired items are cleaned up lazily (on access or when disk is full). Enable automatic background pruning for proactive cleanup:
+
+```typescript
+const cache = new FsLruCache({ pruneInterval: 60000 }); // Every 60 seconds
+
+// Or prune manually
+const removed = await cache.prune();
+console.log(`Removed ${removed} expired items`);
+```
+
 ## Examples
 
 ### Session Store
@@ -198,7 +212,7 @@ console.log(`Disk: ${stats.disk.items} items, ${stats.disk.size} bytes`);
 1. **Writes** go to both memory and disk (write-through)
 2. **Reads** check memory first, then disk (promoting hits to memory)
 3. **LRU eviction** in both tiers when limits are exceeded
-4. **Lazy expiration** - TTL checked on access, not via background jobs
+4. **Expiration** - Lazy by default, or automatic with `pruneInterval`
 5. **Sharded storage** - Files distributed across subdirectories for performance
 
 ## License

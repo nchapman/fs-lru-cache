@@ -27,6 +27,9 @@ export class FsLruCache {
   // In-flight operations for stampede protection
   private inFlight = new Map<string, Promise<unknown>>();
 
+  // Background prune interval
+  private pruneTimer?: ReturnType<typeof setInterval>;
+
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
     this.maxMemorySize = opts.maxMemorySize;
@@ -44,6 +47,15 @@ export class FsLruCache {
       maxSize: opts.maxDiskSize,
       gzip: opts.gzip,
     });
+
+    // Start background pruning if configured
+    if (opts.pruneInterval && opts.pruneInterval > 0) {
+      this.pruneTimer = setInterval(() => {
+        this.prune().catch(() => {});
+      }, opts.pruneInterval);
+      // Don't keep the process alive just for pruning
+      this.pruneTimer.unref();
+    }
   }
 
   /**
@@ -359,6 +371,19 @@ export class FsLruCache {
   }
 
   /**
+   * Remove all expired entries from the cache.
+   * This is called automatically if pruneInterval is configured.
+   * @returns Number of entries removed
+   */
+  async prune(): Promise<number> {
+    this.assertOpen();
+    // Prune both stores, but return disk count as source of truth
+    // (memory may have fewer items due to LRU eviction)
+    this.memory.prune();
+    return this.files.prune();
+  }
+
+  /**
    * Get cache statistics.
    */
   async stats(): Promise<CacheStats> {
@@ -410,6 +435,10 @@ export class FsLruCache {
    * After closing, all operations will throw.
    */
   async close(): Promise<void> {
+    if (this.pruneTimer) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = undefined;
+    }
     this.closed = true;
     this.inFlight.clear();
   }

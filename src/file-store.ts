@@ -498,6 +498,30 @@ export class FileStore {
   }
 
   /**
+   * Remove all expired entries from disk.
+   * Uses the in-memory index for efficient lookup (no filesystem scan).
+   * @returns Number of entries removed
+   */
+  async prune(): Promise<number> {
+    await this.init();
+
+    const now = Date.now();
+    const expired: string[] = [];
+
+    // Collect expired keys from index
+    for (const [key, entry] of this.index) {
+      if (entry.expiresAt !== null && entry.expiresAt <= now) {
+        expired.push(key);
+      }
+    }
+
+    // Delete expired entries
+    await Promise.all(expired.map((key) => this.delete(key)));
+
+    return expired.length;
+  }
+
+  /**
    * Ensure we have space for new data by evicting entries.
    * Priority: expired items first, then LRU (oldest lastAccessedAt).
    */

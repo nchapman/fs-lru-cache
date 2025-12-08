@@ -24,6 +24,8 @@ export interface CacheOptions {
   namespace?: string;
   /** Enable gzip compression for disk storage (default: false). Reduces disk usage at the cost of CPU. */
   gzip?: boolean;
+  /** Interval in milliseconds for automatic pruning of expired items (default: disabled). */
+  pruneInterval?: number;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -70,4 +72,5 @@ export const DEFAULT_OPTIONS = {
   defaultTtl: undefined as number | undefined,
   namespace: undefined as string | undefined,
   gzip: false,
+  pruneInterval: undefined as number | undefined,
 };
