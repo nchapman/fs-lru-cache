@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 
 /**
- * Generate a hash for a cache key
+ * Generate a hash for a cache key.
  * Returns a 32-character hex string (128 bits - collision resistant to ~2^64 keys)
  */
 export function hashKey(key: string): string {
@@ -13,8 +13,7 @@ export function hashKey(key: string): string {
  */
 export function getShardIndex(key: string, shardCount: number): number {
   const hash = hashKey(key);
-  const num = parseInt(hash.slice(0, 8), 16);
-  return num % shardCount;
+  return parseInt(hash.slice(0, 8), 16) % shardCount;
 }
 
 /**
@@ -35,31 +34,25 @@ export function estimateSize(value: unknown): number {
  * Check if a cache entry has expired
  */
 export function isExpired(expiresAt: number | null): boolean {
-  if (expiresAt === null) return false;
-  return Date.now() > expiresAt;
+  return expiresAt !== null && Date.now() > expiresAt;
 }
 
 /**
- * Compile a glob pattern to a RegExp for efficient reuse
+ * Compile a glob pattern to a RegExp for efficient reuse.
+ * Returns null for '*' (match all) as an optimization.
  */
 export function compilePattern(pattern: string): RegExp | null {
-  if (pattern === '*') return null; // null means "match all"
-  return new RegExp(
-    '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'
-  );
+  if (pattern === '*') return null;
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`);
 }
 
 /**
- * Simple glob pattern matching for keys
- * Supports * as wildcard
- * For bulk operations, use compilePattern() and pass the regex to avoid recompilation
+ * Test if a key matches a pattern.
+ * Accepts a pre-compiled RegExp, a string pattern, or null (match all).
  */
 export function matchPattern(key: string, pattern: string | RegExp | null): boolean {
-  if (pattern === '*' || pattern === null) return true;
+  if (pattern === null || pattern === '*') return true;
   if (pattern instanceof RegExp) return pattern.test(key);
-
-  const regex = new RegExp(
-    '^' + pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'
-  );
-  return regex.test(key);
+  return compilePattern(pattern)!.test(key);
 }

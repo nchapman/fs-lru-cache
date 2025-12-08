@@ -18,7 +18,7 @@ interface IndexEntry {
 }
 
 /**
- * File system storage layer with sharding and in-memory index
+ * File system storage layer with sharding and in-memory index.
  */
 export class FileStore {
   private readonly dir: string;
@@ -27,9 +27,9 @@ export class FileStore {
   private initialized = false;
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
-  private index: Map<string, IndexEntry> = new Map();
-  // Reverse mapping: hash -> key (to detect collisions on write)
-  private hashToKey: Map<string, string> = new Map();
+  private index = new Map<string, IndexEntry>();
+  // Reverse mapping: hash -> key (to detect collisions)
+  private hashToKey = new Map<string, string>();
   private totalSize = 0;
 
   constructor(options: FileStoreOptions) {
@@ -47,14 +47,12 @@ export class FileStore {
     await fs.mkdir(this.dir, { recursive: true });
 
     // Create shard directories
-    for (let i = 0; i < this.shards; i++) {
-      const shardDir = join(this.dir, getShardName(i));
-      await fs.mkdir(shardDir, { recursive: true });
-    }
+    const shardPromises = Array.from({ length: this.shards }, (_, i) =>
+      fs.mkdir(join(this.dir, getShardName(i)), { recursive: true })
+    );
+    await Promise.all(shardPromises);
 
-    // Load index from existing files
     await this.loadIndex();
-
     this.initialized = true;
   }
 
@@ -66,45 +64,54 @@ export class FileStore {
     this.hashToKey.clear();
     this.totalSize = 0;
 
-    for (let i = 0; i < this.shards; i++) {
-      const shardDir = join(this.dir, getShardName(i));
+    const loadShard = async (shardIndex: number) => {
+      const shardDir = join(this.dir, getShardName(shardIndex));
+      let files: string[];
 
       try {
-        const files = await fs.readdir(shardDir);
-
-        for (const file of files) {
-          if (!file.endsWith('.json')) continue;
-
-          const filePath = join(shardDir, file);
-          try {
-            const [stat, content] = await Promise.all([
-              fs.stat(filePath),
-              fs.readFile(filePath, 'utf8'),
-            ]);
-            const data: CacheEntry = JSON.parse(content);
-
-            // Skip expired entries (clean them up)
-            if (isExpired(data.expiresAt)) {
-              await fs.unlink(filePath).catch(() => {});
-              continue;
-            }
-
-            const hash = file.replace('.json', '');
-            this.index.set(data.key, {
-              hash,
-              expiresAt: data.expiresAt,
-              lastAccessedAt: stat.mtimeMs, // Use mtime for existing files
-              size: stat.size,
-            });
-            this.hashToKey.set(hash, data.key);
-            this.totalSize += stat.size;
-          } catch {
-            // Skip invalid files
-          }
-        }
+        files = await fs.readdir(shardDir);
       } catch {
-        // Shard dir doesn't exist yet
+        return; // Shard doesn't exist yet
       }
+
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        await this.loadFile(shardDir, file);
+      }
+    };
+
+    await Promise.all(Array.from({ length: this.shards }, (_, i) => loadShard(i)));
+  }
+
+  /**
+   * Load a single cache file into the index
+   */
+  private async loadFile(shardDir: string, file: string): Promise<void> {
+    const filePath = join(shardDir, file);
+
+    try {
+      const [stat, content] = await Promise.all([
+        fs.stat(filePath),
+        fs.readFile(filePath, 'utf8'),
+      ]);
+      const data: CacheEntry = JSON.parse(content);
+
+      if (isExpired(data.expiresAt)) {
+        await fs.unlink(filePath).catch(() => {});
+        return;
+      }
+
+      const hash = file.replace('.json', '');
+      this.index.set(data.key, {
+        hash,
+        expiresAt: data.expiresAt,
+        lastAccessedAt: stat.mtimeMs,
+        size: stat.size,
+      });
+      this.hashToKey.set(hash, data.key);
+      this.totalSize += stat.size;
+    } catch {
+      // Skip invalid files
     }
   }
 
@@ -112,28 +119,23 @@ export class FileStore {
    * Get the file path for a key
    */
   private getFilePath(key: string): string {
-    const shardIndex = getShardIndex(key, this.shards);
-    const shardName = getShardName(shardIndex);
-    const hash = hashKey(key);
-    return join(this.dir, shardName, `${hash}.json`);
+    const shardName = getShardName(getShardIndex(key, this.shards));
+    return join(this.dir, shardName, `${hashKey(key)}.json`);
   }
 
   /**
    * Get the file path using a hash directly
    */
   private getFilePathFromHash(hash: string, key: string): string {
-    const shardIndex = getShardIndex(key, this.shards);
-    const shardName = getShardName(shardIndex);
+    const shardName = getShardName(getShardIndex(key, this.shards));
     return join(this.dir, shardName, `${hash}.json`);
   }
 
   /**
    * Generate a temporary file path for atomic writes
-   * Uses the cache directory to ensure same filesystem (avoids cross-device rename failures)
    */
   private getTempPath(): string {
-    const id = randomBytes(8).toString('hex');
-    return join(this.dir, `.tmp-${id}`);
+    return join(this.dir, `.tmp-${randomBytes(8).toString('hex')}`);
   }
 
   /**
@@ -145,51 +147,67 @@ export class FileStore {
       await fs.writeFile(tempPath, content, 'utf8');
       await fs.rename(tempPath, filePath);
     } catch (err) {
-      // Clean up temp file on failure
       await fs.unlink(tempPath).catch(() => {});
       throw err;
     }
   }
 
   /**
-   * Get a value from disk
-   * Returns the full cache entry (key, value, expiresAt) for consistency
+   * Get a valid index entry, removing it if expired
    */
-  async get<T = unknown>(key: string): Promise<CacheEntry<T> | null> {
-    await this.init();
+  private async getValidIndexEntry(key: string): Promise<IndexEntry | null> {
+    const entry = this.index.get(key);
+    if (!entry) return null;
 
-    const indexEntry = this.index.get(key);
-    if (!indexEntry) return null;
-
-    // Check expiry from index first (fast path)
-    if (isExpired(indexEntry.expiresAt)) {
+    if (isExpired(entry.expiresAt)) {
       await this.delete(key);
       return null;
     }
+    return entry;
+  }
 
+  /**
+   * Read and parse a cache file, handling errors and key mismatches
+   */
+  private async readCacheFile<T>(
+    key: string,
+    indexEntry: IndexEntry
+  ): Promise<CacheEntry<T> | null> {
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
     try {
       const content = await fs.readFile(filePath, 'utf8');
       const entry: CacheEntry<T> = JSON.parse(content);
 
-      // Verify the key matches (in case of hash collision)
+      // Verify key matches (hash collision check)
       if (entry.key !== key) {
-        // Hash collision - remove from index, file belongs to different key
         this.index.delete(key);
         return null;
       }
-
-      // Update lastAccessedAt in index (for LRU tracking)
-      indexEntry.lastAccessedAt = Date.now();
-
       return entry;
     } catch {
-      // File missing or corrupted - remove from index
+      // File missing or corrupted
       this.totalSize -= indexEntry.size;
       this.index.delete(key);
       return null;
     }
+  }
+
+  /**
+   * Get a value from disk.
+   * Returns the full cache entry for consistency with memory store.
+   */
+  async get<T = unknown>(key: string): Promise<CacheEntry<T> | null> {
+    await this.init();
+
+    const indexEntry = await this.getValidIndexEntry(key);
+    if (!indexEntry) return null;
+
+    const entry = await this.readCacheFile<T>(key, indexEntry);
+    if (entry) {
+      indexEntry.lastAccessedAt = Date.now();
+    }
+    return entry;
   }
 
   /**
@@ -198,28 +216,10 @@ export class FileStore {
   async peek(key: string): Promise<CacheEntry | null> {
     await this.init();
 
-    const indexEntry = this.index.get(key);
+    const indexEntry = await this.getValidIndexEntry(key);
     if (!indexEntry) return null;
 
-    if (isExpired(indexEntry.expiresAt)) {
-      await this.delete(key);
-      return null;
-    }
-
-    const filePath = this.getFilePathFromHash(indexEntry.hash, key);
-
-    try {
-      const content = await fs.readFile(filePath, 'utf8');
-      const entry: CacheEntry = JSON.parse(content);
-
-      if (entry.key !== key) return null;
-
-      return entry;
-    } catch {
-      this.totalSize -= indexEntry.size;
-      this.index.delete(key);
-      return null;
-    }
+    return this.readCacheFile(key, indexEntry);
   }
 
   /**
@@ -240,14 +240,14 @@ export class FileStore {
     const hash = hashKey(key);
     const filePath = this.getFilePath(key);
 
-    // Remove old entry size from total if exists
+    // Remove old entry if exists
     const existing = this.index.get(key);
     if (existing) {
       this.totalSize -= existing.size;
       this.hashToKey.delete(existing.hash);
     }
 
-    // Handle hash collision: if another key owns this hash, remove it from index
+    // Handle hash collision: if another key owns this hash, remove it
     const collidingKey = this.hashToKey.get(hash);
     if (collidingKey && collidingKey !== key) {
       const collidingEntry = this.index.get(collidingKey);
@@ -257,13 +257,9 @@ export class FileStore {
       }
     }
 
-    // Check if we need to evict
     await this.ensureSpace(size);
-
-    // Atomic write
     await this.atomicWrite(filePath, serialized);
 
-    // Update index
     this.index.set(key, {
       hash,
       expiresAt,
@@ -285,7 +281,7 @@ export class FileStore {
 
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
-    // Update index first
+    // Update index first (before I/O)
     this.totalSize -= indexEntry.size;
     this.index.delete(key);
     this.hashToKey.delete(indexEntry.hash);
@@ -303,16 +299,7 @@ export class FileStore {
    */
   async has(key: string): Promise<boolean> {
     await this.init();
-
-    const indexEntry = this.index.get(key);
-    if (!indexEntry) return false;
-
-    if (isExpired(indexEntry.expiresAt)) {
-      await this.delete(key);
-      return false;
-    }
-
-    return true;
+    return (await this.getValidIndexEntry(key)) !== null;
   }
 
   /**
@@ -321,22 +308,22 @@ export class FileStore {
   async keys(pattern = '*'): Promise<string[]> {
     await this.init();
 
-    const result: string[] = [];
-    const toDelete: string[] = [];
     const compiled = compilePattern(pattern);
+    const result: string[] = [];
+    const expiredKeys: string[] = [];
 
     for (const [key, entry] of this.index) {
       if (isExpired(entry.expiresAt)) {
-        toDelete.push(key);
-        continue;
-      }
-      if (matchPattern(key, compiled)) {
+        expiredKeys.push(key);
+      } else if (matchPattern(key, compiled)) {
         result.push(key);
       }
     }
 
     // Clean up expired entries in parallel
-    await Promise.all(toDelete.map((key) => this.delete(key)));
+    if (expiredKeys.length > 0) {
+      await Promise.all(expiredKeys.map((key) => this.delete(key)));
+    }
 
     return result;
   }
@@ -347,13 +334,8 @@ export class FileStore {
   async setExpiry(key: string, expiresAt: number | null): Promise<boolean> {
     await this.init();
 
-    const indexEntry = this.index.get(key);
+    const indexEntry = await this.getValidIndexEntry(key);
     if (!indexEntry) return false;
-
-    if (isExpired(indexEntry.expiresAt)) {
-      await this.delete(key);
-      return false;
-    }
 
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
@@ -365,10 +347,9 @@ export class FileStore {
 
       entry.expiresAt = expiresAt;
       const serialized = JSON.stringify(entry);
-
       await this.atomicWrite(filePath, serialized);
 
-      // Update index and totalSize
+      // Update index
       const newSize = Buffer.byteLength(serialized, 'utf8');
       this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
@@ -381,19 +362,14 @@ export class FileStore {
   }
 
   /**
-   * Get TTL for a key in milliseconds (fast - uses index)
+   * Get TTL for a key in milliseconds (fast - uses index).
+   * Returns -1 if no expiry, -2 if not found.
    */
   async getTtl(key: string): Promise<number> {
     await this.init();
 
-    const indexEntry = this.index.get(key);
+    const indexEntry = await this.getValidIndexEntry(key);
     if (!indexEntry) return -2;
-
-    if (isExpired(indexEntry.expiresAt)) {
-      await this.delete(key);
-      return -2;
-    }
-
     if (indexEntry.expiresAt === null) return -1;
     return Math.max(0, indexEntry.expiresAt - Date.now());
   }
@@ -404,9 +380,8 @@ export class FileStore {
   async clear(): Promise<void> {
     await this.init();
 
-    for (let i = 0; i < this.shards; i++) {
-      const shardDir = join(this.dir, getShardName(i));
-
+    const clearShard = async (shardIndex: number) => {
+      const shardDir = join(this.dir, getShardName(shardIndex));
       try {
         const files = await fs.readdir(shardDir);
         await Promise.all(
@@ -415,7 +390,9 @@ export class FileStore {
       } catch {
         // Ignore errors
       }
-    }
+    };
+
+    await Promise.all(Array.from({ length: this.shards }, (_, i) => clearShard(i)));
 
     this.index.clear();
     this.hashToKey.clear();
@@ -439,24 +416,20 @@ export class FileStore {
   }
 
   /**
-   * Ensure we have space for new data by evicting entries
-   * Priority: expired items first, then LRU (oldest lastAccessedAt)
-   * Optimized to avoid sorting the entire index
+   * Ensure we have space for new data by evicting entries.
+   * Priority: expired items first, then LRU (oldest lastAccessedAt).
    */
   private async ensureSpace(needed: number): Promise<void> {
     if (this.totalSize + needed <= this.maxSize) return;
 
-    const now = Date.now();
     const target = this.totalSize + needed - this.maxSize;
     let freed = 0;
+    const now = Date.now();
 
-    // First pass: delete all expired entries
-    const expiredKeys: string[] = [];
-    for (const [key, entry] of this.index) {
-      if (entry.expiresAt !== null && entry.expiresAt <= now) {
-        expiredKeys.push(key);
-      }
-    }
+    // First pass: collect and delete all expired entries
+    const expiredKeys = Array.from(this.index.entries())
+      .filter(([, entry]) => entry.expiresAt !== null && entry.expiresAt <= now)
+      .map(([key]) => key);
 
     for (const key of expiredKeys) {
       if (freed >= target) return;
@@ -465,20 +438,26 @@ export class FileStore {
 
     // Second pass: evict oldest entries until we have enough space
     while (freed < target && this.index.size > 0) {
-      // Find the oldest entry (O(n) but avoids sorting everything)
-      let oldestKey: string | null = null;
-      let oldestTime = Infinity;
-
-      for (const [key, entry] of this.index) {
-        if (entry.lastAccessedAt < oldestTime) {
-          oldestTime = entry.lastAccessedAt;
-          oldestKey = key;
-        }
-      }
-
+      const oldestKey = this.findOldestKey();
       if (!oldestKey) break;
       freed += await this.evictKey(oldestKey);
     }
+  }
+
+  /**
+   * Find the key with the oldest lastAccessedAt
+   */
+  private findOldestKey(): string | null {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [key, entry] of this.index) {
+      if (entry.lastAccessedAt < oldestTime) {
+        oldestTime = entry.lastAccessedAt;
+        oldestKey = key;
+      }
+    }
+    return oldestKey;
   }
 
   /**
@@ -489,16 +468,18 @@ export class FileStore {
     if (!entry) return 0;
 
     const filePath = this.getFilePathFromHash(entry.hash, key);
+    const freedSize = entry.size;
+
+    this.totalSize -= entry.size;
+    this.index.delete(key);
+    this.hashToKey.delete(entry.hash);
 
     try {
       await fs.unlink(filePath);
-      const freedSize = entry.size;
-      this.totalSize -= entry.size;
-      this.index.delete(key);
-      this.hashToKey.delete(entry.hash);
-      return freedSize;
     } catch {
-      return 0;
+      // File may already be gone
     }
+
+    return freedSize;
   }
 }
