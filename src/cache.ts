@@ -170,6 +170,57 @@ export class FsLruCache {
   }
 
   /**
+   * Increment a number by 1
+   * Creates key with value 1 if it doesn't exist
+   * @throws TypeError if value is not a number
+   */
+  async incr(key: string): Promise<number> {
+    return this.incrby(key, 1);
+  }
+
+  /**
+   * Increment a number by a specified amount
+   * Creates key with the amount if it doesn't exist
+   * @throws TypeError if value is not a number
+   */
+  async incrby(key: string, amount: number): Promise<number> {
+    const current = await this.get<unknown>(key);
+    const ttl = await this.pttl(key);
+
+    let newValue: number;
+    if (current === null) {
+      newValue = amount;
+    } else if (typeof current === 'number') {
+      newValue = current + amount;
+    } else {
+      throw new TypeError(`Value at key "${key}" is not a number`);
+    }
+
+    const ttlMs = ttl > 0 ? ttl : undefined;
+    await this.set(key, newValue, ttlMs);
+
+    return newValue;
+  }
+
+  /**
+   * Decrement a number by 1
+   * Creates key with value -1 if it doesn't exist
+   * @throws TypeError if value is not a number
+   */
+  async decr(key: string): Promise<number> {
+    return this.incrby(key, -1);
+  }
+
+  /**
+   * Decrement a number by a specified amount
+   * Creates key with the negative amount if it doesn't exist
+   * @throws TypeError if value is not a number
+   */
+  async decrby(key: string, amount: number): Promise<number> {
+    return this.incrby(key, -amount);
+  }
+
+  /**
    * Get cache statistics
    */
   async stats(): Promise<CacheStats> {
