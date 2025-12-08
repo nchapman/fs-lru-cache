@@ -45,6 +45,9 @@ export class FsLruCache {
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
       gzip: opts.gzip,
+      // Keep memory in sync: when disk evicts a key, remove from memory too.
+      // This ensures memory is always a subset of disk (source of truth).
+      onEvict: (key) => this.memory.delete(key),
     });
 
     // Start background pruning if configured
@@ -253,10 +256,15 @@ export class FsLruCache {
     const prefixedKey = this.prefixKey(key);
     const expiresAt = Date.now() + ms;
 
-    const memSuccess = this.memory.setExpiry(prefixedKey, expiresAt);
+    // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.setExpiry(prefixedKey, expiresAt);
+    if (!diskSuccess) {
+      return false;
+    }
 
-    return memSuccess || diskSuccess;
+    // Memory second - best effort (memory is just a hot cache)
+    this.memory.setExpiry(prefixedKey, expiresAt);
+    return true;
   }
 
   /**
@@ -267,10 +275,15 @@ export class FsLruCache {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
-    const memSuccess = this.memory.setExpiry(prefixedKey, null);
+    // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.setExpiry(prefixedKey, null);
+    if (!diskSuccess) {
+      return false;
+    }
 
-    return memSuccess || diskSuccess;
+    // Memory second - best effort (memory is just a hot cache)
+    this.memory.setExpiry(prefixedKey, null);
+    return true;
   }
 
   /**
@@ -286,10 +299,15 @@ export class FsLruCache {
 
     const expiresAt = ttlMs !== undefined ? Date.now() + ttlMs : undefined;
 
-    const memSuccess = this.memory.touch(prefixedKey, expiresAt);
+    // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.touch(prefixedKey, expiresAt);
+    if (!diskSuccess) {
+      return false;
+    }
 
-    return memSuccess || diskSuccess;
+    // Memory second - best effort (memory is just a hot cache)
+    this.memory.touch(prefixedKey, expiresAt);
+    return true;
   }
 
   /**

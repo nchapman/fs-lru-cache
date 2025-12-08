@@ -1560,4 +1560,175 @@ describe("FsLruCache", () => {
       await smallCache.close();
     });
   });
+
+  describe("memory/disk synchronization", () => {
+    it("should remove from memory when disk evicts due to space pressure", async () => {
+      // Create cache where disk is small but memory is large
+      // This ensures items fit in memory but disk will need to evict
+      const smallDiskCache = createTestCache("sync-disk-evict", {
+        maxMemoryItems: 100,
+        maxMemorySize: 10 * 1024,
+        maxDiskSize: 200, // Very small disk
+        shards: 2,
+      });
+
+      // Add items - they'll all fit in memory but not all on disk
+      await smallDiskCache.set("first", "x".repeat(50));
+      await smallDiskCache.set("second", "x".repeat(50));
+
+      // At this point, both should be in memory
+      let stats = await smallDiskCache.stats();
+      expect(stats.memory.items).toBe(2);
+
+      // Add another item - disk will need to evict "first"
+      await smallDiskCache.set("third", "x".repeat(50));
+
+      // Verify memory is synced - "first" should be gone from memory too
+      stats = await smallDiskCache.stats();
+      expect(stats.disk.items).toBeLessThanOrEqual(2);
+      // Memory should match disk (minus items too large for memory)
+      expect(stats.memory.items).toBeLessThanOrEqual(stats.disk.items);
+
+      // The evicted key should return null (not stale data from memory)
+      const evictedValue = await smallDiskCache.get("first");
+      if (evictedValue === null) {
+        // Key was evicted - verify it's gone from both caches
+        expect(await smallDiskCache.exists("first")).toBe(false);
+      }
+      // If not null, it wasn't the one evicted - that's also fine
+
+      await smallDiskCache.close();
+    });
+
+    it("should not return stale data from memory after disk eviction", async () => {
+      const smallDiskCache = createTestCache("sync-no-stale", {
+        maxMemoryItems: 100,
+        maxMemorySize: 10 * 1024,
+        maxDiskSize: 150, // Very small disk - will evict early
+        shards: 2,
+      });
+
+      // Set first key
+      await smallDiskCache.set("evict-me", "original-value");
+      expect(await smallDiskCache.get("evict-me")).toBe("original-value");
+
+      // Force eviction by adding more data
+      await smallDiskCache.set("keep1", "x".repeat(50));
+      await smallDiskCache.set("keep2", "x".repeat(50));
+
+      // The evicted key should either:
+      // 1. Return null (properly evicted from both caches)
+      // 2. Return the value (wasn't evicted yet)
+      // It should NEVER return stale/orphaned data
+      const result = await smallDiskCache.get("evict-me");
+      if (result !== null) {
+        // If we got a value, it should still exist on disk
+        expect(await smallDiskCache.exists("evict-me")).toBe(true);
+      }
+
+      await smallDiskCache.close();
+    });
+
+    it("should keep caches consistent when touch fails on disk-only key", async () => {
+      const smallCache = createTestCache("sync-touch-diskonly", {
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallCache.set("a", "value-a");
+      await smallCache.set("b", "value-b"); // Evicts 'a' from memory
+
+      // 'a' is on disk only, 'b' is in memory
+      const stats = await smallCache.stats();
+      expect(stats.memory.items).toBe(1);
+      expect(stats.disk.items).toBe(2);
+
+      // Touch should work on disk-only keys
+      expect(await smallCache.touch("a", 5000)).toBe(true);
+
+      // Touch should return false for non-existent keys
+      expect(await smallCache.touch("nonexistent")).toBe(false);
+
+      await smallCache.close();
+    });
+
+    it("should be consistent after pexpire on disk-only key", async () => {
+      const smallCache = createTestCache("sync-pexpire-diskonly", {
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallCache.set("a", "value-a");
+      await smallCache.set("b", "value-b"); // Evicts 'a' from memory
+
+      // pexpire on disk-only key should work
+      expect(await smallCache.pexpire("a", 5000)).toBe(true);
+      expect(await smallCache.pttl("a")).toBeGreaterThan(4000);
+
+      // Value should still be retrievable
+      expect(await smallCache.get("a")).toBe("value-a");
+
+      await smallCache.close();
+    });
+
+    it("should be consistent after persist on disk-only key", async () => {
+      const smallCache = createTestCache("sync-persist-diskonly", {
+        maxMemoryItems: 1,
+        shards: 2,
+      });
+
+      await smallCache.set("a", "value-a", 5000);
+      await smallCache.set("b", "value-b"); // Evicts 'a' from memory
+
+      // 'a' is on disk only with TTL
+      expect(await smallCache.pttl("a")).toBeGreaterThan(4000);
+
+      // persist on disk-only key should work
+      expect(await smallCache.persist("a")).toBe(true);
+      expect(await smallCache.pttl("a")).toBe(-1);
+
+      // Value should still be retrievable
+      expect(await smallCache.get("a")).toBe("value-a");
+
+      await smallCache.close();
+    });
+
+    it("should return false for TTL operations on non-existent keys", async () => {
+      const testCache = createTestCache("sync-ttl-nonexistent");
+
+      expect(await testCache.pexpire("ghost", 5000)).toBe(false);
+      expect(await testCache.persist("ghost")).toBe(false);
+      expect(await testCache.touch("ghost")).toBe(false);
+
+      await testCache.close();
+    });
+
+    it("memory items should always be subset of disk items", async () => {
+      const testCache = createTestCache("sync-subset", {
+        maxMemoryItems: 5,
+        maxMemorySize: 500,
+        maxDiskSize: 2000,
+        shards: 2,
+      });
+
+      // Add many items
+      for (let i = 0; i < 20; i++) {
+        await testCache.set(`key-${i}`, `value-${i}`);
+      }
+
+      const stats = await testCache.stats();
+
+      // Memory should be <= disk (memory is a subset)
+      expect(stats.memory.items).toBeLessThanOrEqual(stats.disk.items);
+
+      // Every key that exists should return a value (no orphaned memory entries)
+      const allKeys = await testCache.keys();
+      for (const key of allKeys) {
+        const value = await testCache.get(key);
+        expect(value).not.toBeNull();
+      }
+
+      await testCache.close();
+    });
+  });
 });

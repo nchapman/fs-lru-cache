@@ -20,6 +20,15 @@ export interface FileStoreOptions {
   shards: number;
   maxSize: number;
   gzip?: boolean;
+  /**
+   * Called synchronously when a key is evicted due to:
+   * - Hash collision (another key claims the same hash)
+   * - Space pressure (LRU eviction to stay under maxSize)
+   *
+   * NOT called for explicit delete() operations.
+   * This allows the parent to keep other caches in sync.
+   */
+  onEvict?: (key: string) => void;
 }
 
 interface IndexEntry {
@@ -37,6 +46,7 @@ export class FileStore {
   private readonly shards: number;
   private readonly maxSize: number;
   private readonly gzip: boolean;
+  private readonly onEvict?: (key: string) => void;
   private initialized = false;
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
@@ -50,6 +60,7 @@ export class FileStore {
     this.shards = options.shards;
     this.maxSize = options.maxSize;
     this.gzip = options.gzip ?? false;
+    this.onEvict = options.onEvict;
   }
 
   /**
@@ -293,6 +304,12 @@ export class FileStore {
       if (collidingEntry) {
         this.totalSize -= collidingEntry.size;
         this.index.delete(collidingKey);
+        // Notify parent about the collision eviction (wrapped to ensure set() completes)
+        try {
+          this.onEvict?.(collidingKey);
+        } catch {
+          // Callback errors shouldn't fail the set operation
+        }
       }
     }
 
@@ -567,7 +584,8 @@ export class FileStore {
   }
 
   /**
-   * Evict a single key and return the freed size
+   * Evict a single key and return the freed size.
+   * Calls onEvict callback to notify parent of the eviction.
    */
   private async evictKey(key: string): Promise<number> {
     const entry = this.index.get(key);
@@ -579,6 +597,13 @@ export class FileStore {
     this.totalSize -= entry.size;
     this.index.delete(key);
     this.hashToKey.delete(entry.hash);
+
+    // Notify parent before disk I/O (wrapped to ensure cleanup completes)
+    try {
+      this.onEvict?.(key);
+    } catch {
+      // Callback errors shouldn't fail the eviction
+    }
 
     try {
       await fs.unlink(filePath);

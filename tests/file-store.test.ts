@@ -270,4 +270,94 @@ describe("FileStore", () => {
       expect(await newStore.get("permanent")).not.toBeNull();
     });
   });
+
+  describe("onEvict callback", () => {
+    it("should call onEvict when LRU eviction occurs", async () => {
+      const evictedKeys: string[] = [];
+      const dir = testDir("evict-callback-lru");
+      registerCleanup(dir);
+
+      const smallStore = new FileStore({
+        dir,
+        shards: 2,
+        maxSize: 200,
+        onEvict: (key) => evictedKeys.push(key),
+      });
+
+      // Fill up the store
+      await smallStore.set("first", "x".repeat(50));
+      await delay(5);
+      await smallStore.set("second", "x".repeat(50));
+      await delay(5);
+
+      // This should trigger eviction of "first"
+      await smallStore.set("third", "x".repeat(50));
+
+      // Verify callback was called
+      expect(evictedKeys.length).toBeGreaterThan(0);
+      expect(evictedKeys).toContain("first");
+    });
+
+    it("should call onEvict when expired entries are evicted during space check", async () => {
+      const evictedKeys: string[] = [];
+      const dir = testDir("evict-callback-expire");
+      registerCleanup(dir);
+
+      const smallStore = new FileStore({
+        dir,
+        shards: 2,
+        maxSize: 200,
+        onEvict: (key) => evictedKeys.push(key),
+      });
+
+      // Set an expiring key
+      await smallStore.set("expiring", "x".repeat(50), Date.now() + 50);
+      await smallStore.set("permanent", "x".repeat(50));
+
+      // Wait for expiration
+      await delay(60);
+
+      // This should trigger eviction of expired "expiring" key
+      await smallStore.set("new", "x".repeat(50));
+
+      expect(evictedKeys).toContain("expiring");
+    });
+
+    it("should NOT call onEvict for explicit delete operations", async () => {
+      const evictedKeys: string[] = [];
+      const dir = testDir("evict-callback-delete");
+      registerCleanup(dir);
+
+      const storeWithCallback = new FileStore({
+        dir,
+        shards: 2,
+        maxSize: 1024 * 1024,
+        onEvict: (key) => evictedKeys.push(key),
+      });
+
+      await storeWithCallback.set("key", "value");
+      await storeWithCallback.delete("key");
+
+      // delete() is explicit, not eviction - should NOT trigger callback
+      expect(evictedKeys).not.toContain("key");
+    });
+
+    it("should work correctly without onEvict callback", async () => {
+      const dir = testDir("no-callback");
+      registerCleanup(dir);
+
+      // No callback - should not throw
+      const storeNoCallback = new FileStore({
+        dir,
+        shards: 2,
+        maxSize: 150,
+      });
+
+      await storeNoCallback.set("a", "x".repeat(40));
+      await storeNoCallback.set("b", "x".repeat(40));
+      await storeNoCallback.set("c", "x".repeat(40)); // Triggers eviction
+
+      expect(await storeNoCallback.getItemCount()).toBeLessThan(3);
+    });
+  });
 });
