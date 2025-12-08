@@ -25,6 +25,27 @@ export interface MemoryEntry<T = unknown> extends CacheEntry<T> {
   size: number;
 }
 
+export interface CacheStats {
+  /** Total cache hits */
+  hits: number;
+  /** Total cache misses */
+  misses: number;
+  /** Hit rate (0-1) */
+  hitRate: number;
+  /** Memory store statistics */
+  memory: {
+    items: number;
+    size: number;
+    maxItems: number;
+    maxSize: number;
+  };
+  /** Disk store statistics */
+  disk: {
+    items: number;
+    size: number;
+  };
+}
+
 export const DEFAULT_OPTIONS: Required<CacheOptions> = {
   dir: '.cache',
   maxMemoryItems: 1000,

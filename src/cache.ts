@@ -1,4 +1,4 @@
-import { CacheOptions, DEFAULT_OPTIONS } from './types.js';
+import { CacheOptions, CacheStats, DEFAULT_OPTIONS } from './types.js';
 import { MemoryStore } from './memory-store.js';
 import { FileStore } from './file-store.js';
 
@@ -15,6 +15,8 @@ import { FileStore } from './file-store.js';
 export class FsLruCache {
   private readonly memory: MemoryStore;
   private readonly files: FileStore;
+  private hits = 0;
+  private misses = 0;
 
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
@@ -39,12 +41,14 @@ export class FsLruCache {
     // Check memory first
     const memValue = this.memory.get<T>(key);
     if (memValue !== null) {
+      this.hits++;
       return memValue;
     }
 
     // Check disk
     const diskValue = await this.files.get<T>(key);
     if (diskValue !== null) {
+      this.hits++;
       // Promote to memory
       const entry = await this.files.peek(key);
       if (entry) {
@@ -53,6 +57,7 @@ export class FsLruCache {
       return diskValue;
     }
 
+    this.misses++;
     return null;
   }
 
@@ -144,6 +149,59 @@ export class FsLruCache {
 
     // Check disk
     return await this.files.getTtl(key);
+  }
+
+  /**
+   * Get multiple values at once
+   * Returns array in same order as keys (null for missing/expired)
+   */
+  async mget<T = unknown>(keys: string[]): Promise<(T | null)[]> {
+    return Promise.all(keys.map((key) => this.get<T>(key)));
+  }
+
+  /**
+   * Set multiple key-value pairs at once
+   * @param entries Array of [key, value] or [key, value, ttlMs] tuples
+   */
+  async mset(entries: [string, unknown, number?][]): Promise<void> {
+    await Promise.all(
+      entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs))
+    );
+  }
+
+  /**
+   * Get cache statistics
+   */
+  async stats(): Promise<CacheStats> {
+    const memStats = this.memory.stats;
+    const diskSize = await this.files.getSize();
+    const diskKeys = await this.files.keys();
+
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: this.hits + this.misses > 0
+        ? this.hits / (this.hits + this.misses)
+        : 0,
+      memory: {
+        items: memStats.items,
+        size: memStats.size,
+        maxItems: memStats.maxItems,
+        maxSize: memStats.maxSize,
+      },
+      disk: {
+        items: diskKeys.length,
+        size: diskSize,
+      },
+    };
+  }
+
+  /**
+   * Reset hit/miss counters
+   */
+  resetStats(): void {
+    this.hits = 0;
+    this.misses = 0;
   }
 
   /**

@@ -287,4 +287,141 @@ describe('FsLruCache', () => {
       expect(await cache.get('emoji:🎉')).toEqual({ message: 'Hello 世界' });
     });
   });
+
+  describe('mget', () => {
+    it('should get multiple values at once', async () => {
+      await cache.set('a', 1);
+      await cache.set('b', 2);
+      await cache.set('c', 3);
+
+      const values = await cache.mget(['a', 'b', 'c']);
+      expect(values).toEqual([1, 2, 3]);
+    });
+
+    it('should return null for missing keys', async () => {
+      await cache.set('a', 1);
+      await cache.set('c', 3);
+
+      const values = await cache.mget(['a', 'b', 'c']);
+      expect(values).toEqual([1, null, 3]);
+    });
+
+    it('should return empty array for empty input', async () => {
+      const values = await cache.mget([]);
+      expect(values).toEqual([]);
+    });
+
+    it('should support generic types', async () => {
+      interface Item { id: number }
+      await cache.set('item1', { id: 1 });
+      await cache.set('item2', { id: 2 });
+
+      const values = await cache.mget<Item>(['item1', 'item2']);
+      expect(values[0]?.id).toBe(1);
+      expect(values[1]?.id).toBe(2);
+    });
+  });
+
+  describe('mset', () => {
+    it('should set multiple values at once', async () => {
+      await cache.mset([
+        ['a', 1],
+        ['b', 2],
+        ['c', 3],
+      ]);
+
+      expect(await cache.get('a')).toBe(1);
+      expect(await cache.get('b')).toBe(2);
+      expect(await cache.get('c')).toBe(3);
+    });
+
+    it('should support TTL for individual entries', async () => {
+      await cache.mset([
+        ['short', 'value', 50],
+        ['long', 'value', 5000],
+      ]);
+
+      expect(await cache.get('short')).toBe('value');
+      expect(await cache.get('long')).toBe('value');
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(await cache.get('short')).toBeNull();
+      expect(await cache.get('long')).toBe('value');
+    });
+
+    it('should handle empty array', async () => {
+      await cache.mset([]);
+      expect(await cache.keys()).toEqual([]);
+    });
+
+    it('should overwrite existing values', async () => {
+      await cache.set('a', 'old');
+      await cache.mset([['a', 'new']]);
+      expect(await cache.get('a')).toBe('new');
+    });
+  });
+
+  describe('stats', () => {
+    it('should track hits and misses', async () => {
+      await cache.set('a', 1);
+
+      await cache.get('a'); // hit
+      await cache.get('a'); // hit
+      await cache.get('nonexistent'); // miss
+
+      const stats = await cache.stats();
+      expect(stats.hits).toBe(2);
+      expect(stats.misses).toBe(1);
+      expect(stats.hitRate).toBeCloseTo(2 / 3, 2);
+    });
+
+    it('should return memory stats', async () => {
+      await cache.set('a', 1);
+      await cache.set('b', 2);
+
+      const stats = await cache.stats();
+      expect(stats.memory.items).toBe(2);
+      expect(stats.memory.size).toBeGreaterThan(0);
+      expect(stats.memory.maxItems).toBe(10);
+      expect(stats.memory.maxSize).toBe(1024);
+    });
+
+    it('should return disk stats', async () => {
+      await cache.set('a', 1);
+      await cache.set('b', 2);
+
+      const stats = await cache.stats();
+      expect(stats.disk.items).toBe(2);
+      expect(stats.disk.size).toBeGreaterThan(0);
+    });
+
+    it('should return 0 hit rate when no gets', async () => {
+      const stats = await cache.stats();
+      expect(stats.hitRate).toBe(0);
+    });
+
+    it('should reset stats', async () => {
+      await cache.set('a', 1);
+      await cache.get('a');
+      await cache.get('b');
+
+      cache.resetStats();
+
+      const stats = await cache.stats();
+      expect(stats.hits).toBe(0);
+      expect(stats.misses).toBe(0);
+    });
+
+    it('should track mget hits and misses', async () => {
+      await cache.set('a', 1);
+      await cache.set('b', 2);
+
+      await cache.mget(['a', 'b', 'c']); // 2 hits, 1 miss
+
+      const stats = await cache.stats();
+      expect(stats.hits).toBe(2);
+      expect(stats.misses).toBe(1);
+    });
+  });
 });
