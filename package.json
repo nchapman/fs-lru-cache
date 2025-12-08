@@ -22,6 +22,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench": "tsx benchmark.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -34,6 +35,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
     "prettier": "^3.7.4",
     "tsdown": "^0.17.0",
     "typescript": "^5.9.0",

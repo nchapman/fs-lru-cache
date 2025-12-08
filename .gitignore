@@ -2,6 +2,7 @@ node_modules/
 dist/
 .cache/
 .test-cache-*/
+.bench-cache/
 *.log
 .DS_Store
 coverage/
