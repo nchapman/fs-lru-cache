@@ -46,6 +46,27 @@ describe("FsLruCache", () => {
       await cache.set("key", "value2");
       expect(await cache.get("key")).toBe("value2");
     });
+
+    it("should throw TypeError for undefined values", async () => {
+      await expect(cache.set("key", undefined)).rejects.toThrow(TypeError);
+      await expect(cache.set("key", undefined)).rejects.toThrow("JSON-serializable");
+    });
+
+    it("should throw TypeError for function values", async () => {
+      await expect(cache.set("key", () => {})).rejects.toThrow(TypeError);
+      await expect(cache.set("key", function test() {})).rejects.toThrow("JSON-serializable");
+    });
+
+    it("should throw TypeError for symbol values", async () => {
+      await expect(cache.set("key", Symbol("test"))).rejects.toThrow(TypeError);
+    });
+
+    it("should handle null values correctly", async () => {
+      await cache.set("key", null);
+      expect(await cache.get("key")).toBeNull();
+      // Verify it was actually stored (not just returning null for missing key)
+      expect(await cache.exists("key")).toBe(true);
+    });
   });
 
   describe("del", () => {
@@ -549,6 +570,27 @@ describe("FsLruCache", () => {
       await cache.set("a", "old");
       await cache.mset([["a", "new"]]);
       expect(await cache.get("a")).toBe("new");
+    });
+
+    it("should throw TypeError for undefined values in batch", async () => {
+      await expect(
+        cache.mset([
+          ["a", "valid"],
+          ["b", undefined],
+          ["c", "also valid"],
+        ]),
+      ).rejects.toThrow(TypeError);
+      // Verify no partial writes occurred
+      expect(await cache.get("a")).toBeNull();
+    });
+
+    it("should throw TypeError for function values in batch", async () => {
+      await expect(
+        cache.mset([
+          ["a", 1],
+          ["b", () => {}],
+        ]),
+      ).rejects.toThrow("JSON-serializable");
     });
   });
 

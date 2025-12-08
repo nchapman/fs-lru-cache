@@ -181,6 +181,7 @@ declare class FsLruCache {
   mget<T = unknown>(keys: string[]): Promise<(T | null)[]>;
   /**
    * Set multiple key-value pairs at once.
+   * Optimized to batch serialization and disk writes.
    * @param entries Array of [key, value] or [key, value, ttlMs] tuples
    */
   mset(entries: [string, unknown, number?][]): Promise<void>;

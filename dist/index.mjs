@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "crypto";
 import { promises } from "fs";
 import { join } from "path";
-import { gunzipSync, gzipSync } from "zlib";
+import { gunzip, gzip } from "zlib";
+import { promisify } from "util";
 
 //#region src/types.ts
 const DEFAULT_OPTIONS = {
@@ -238,6 +239,8 @@ var MemoryStore = class {
 
 //#endregion
 //#region src/file-store.ts
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 /** Gzip magic bytes for detecting compressed files */
 const GZIP_MAGIC = Buffer.from([31, 139]);
 /**
@@ -269,15 +272,15 @@ var FileStore = class {
 	/**
 	* Compress data if compression is enabled.
 	*/
-	compress(data) {
+	async compress(data) {
 		const buffer = Buffer.from(data, "utf8");
-		return this.gzip ? gzipSync(buffer) : buffer;
+		return this.gzip ? gzipAsync(buffer) : buffer;
 	}
 	/**
 	* Decompress data, auto-detecting if it's compressed.
 	*/
-	decompress(data) {
-		if (this.isCompressed(data)) return gunzipSync(data).toString("utf8");
+	async decompress(data) {
+		if (this.isCompressed(data)) return (await gunzipAsync(data)).toString("utf8");
 		return data.toString("utf8");
 	}
 	/**
@@ -320,7 +323,7 @@ var FileStore = class {
 		const filePath = join(shardDir, file);
 		try {
 			const [stat, rawContent] = await Promise.all([promises.stat(filePath), promises.readFile(filePath)]);
-			const content = this.decompress(rawContent);
+			const content = await this.decompress(rawContent);
 			const data = JSON.parse(content);
 			if (isExpired(data.expiresAt)) {
 				await promises.unlink(filePath).catch(() => {});
@@ -389,7 +392,7 @@ var FileStore = class {
 		const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 		try {
 			const rawContent = await promises.readFile(filePath);
-			const content = this.decompress(rawContent);
+			const content = await this.decompress(rawContent);
 			const entry = JSON.parse(content);
 			if (entry.key !== key) {
 				this.index.delete(key);
@@ -429,13 +432,12 @@ var FileStore = class {
 	*/
 	async set(key, value, expiresAt = null, content) {
 		await this.init();
-		const entry = {
+		const serialized = content ?? JSON.stringify({
 			key,
 			value,
 			expiresAt
-		};
-		const serialized = content ?? JSON.stringify(entry);
-		const compressed = this.compress(serialized);
+		});
+		const compressed = await this.compress(serialized);
 		const size = compressed.length;
 		const hash = hashKey(key);
 		const filePath = this.getFilePath(key);
@@ -514,12 +516,12 @@ var FileStore = class {
 		const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 		try {
 			const rawContent = await promises.readFile(filePath);
-			const content = this.decompress(rawContent);
+			const content = await this.decompress(rawContent);
 			const entry = JSON.parse(content);
 			if (entry.key !== key) return false;
 			entry.expiresAt = expiresAt;
 			const serialized = JSON.stringify(entry);
-			const compressed = this.compress(serialized);
+			const compressed = await this.compress(serialized);
 			await this.atomicWrite(filePath, compressed);
 			const newSize = compressed.length;
 			this.totalSize += newSize - indexEntry.size;
@@ -555,12 +557,12 @@ var FileStore = class {
 			const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 			try {
 				const rawContent = await promises.readFile(filePath);
-				const content = this.decompress(rawContent);
+				const content = await this.decompress(rawContent);
 				const entry = JSON.parse(content);
 				if (entry.key !== key) return false;
 				entry.expiresAt = expiresAt;
 				const serialized = JSON.stringify(entry);
-				const compressed = this.compress(serialized);
+				const compressed = await this.compress(serialized);
 				await this.atomicWrite(filePath, compressed);
 				const newSize = compressed.length;
 				this.totalSize += newSize - indexEntry.size;
@@ -795,13 +797,9 @@ var FsLruCache = class {
 		const resolvedTtl = this.resolveTtl(ttlMs);
 		const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 		const valueSerialized = JSON.stringify(value);
+		if (valueSerialized === void 0) throw new TypeError(`Cannot cache value of type ${typeof value}. Value must be JSON-serializable.`);
 		const valueSize = Buffer.byteLength(valueSerialized, "utf8");
-		const entry = {
-			key: prefixedKey,
-			value,
-			expiresAt
-		};
-		const entrySerialized = JSON.stringify(entry);
+		const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
 		await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
 		if (valueSize <= this.maxMemorySize) this.memory.set(prefixedKey, valueSerialized, expiresAt);
 	}
@@ -922,10 +920,29 @@ var FsLruCache = class {
 	}
 	/**
 	* Set multiple key-value pairs at once.
+	* Optimized to batch serialization and disk writes.
 	* @param entries Array of [key, value] or [key, value, ttlMs] tuples
 	*/
 	async mset(entries) {
-		await Promise.all(entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs)));
+		this.assertOpen();
+		if (entries.length === 0) return;
+		const prepared = entries.map(([key, value, ttlMs]) => {
+			const prefixedKey = this.prefixKey(key);
+			const resolvedTtl = this.resolveTtl(ttlMs);
+			const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
+			const valueSerialized = JSON.stringify(value);
+			if (valueSerialized === void 0) throw new TypeError(`Cannot cache value of type ${typeof value} for key "${key}". Value must be JSON-serializable.`);
+			return {
+				prefixedKey,
+				value,
+				expiresAt,
+				valueSerialized,
+				valueSize: Buffer.byteLength(valueSerialized, "utf8"),
+				entrySerialized: `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`
+			};
+		});
+		await Promise.all(prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)));
+		for (const p of prepared) if (p.valueSize <= this.maxMemorySize) this.memory.set(p.prefixedKey, p.valueSerialized, p.expiresAt);
 	}
 	/**
 	* Get a value, or compute and set it if it doesn't exist (cache-aside pattern).
