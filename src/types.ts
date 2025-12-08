@@ -18,7 +18,7 @@ export interface CacheOptions {
   maxDiskSize?: number;
   /** Number of shard directories (default: 16) */
   shards?: number;
-  /** Default TTL in milliseconds for all entries (default: none). Use 0 to explicitly disable TTL on a specific set(). */
+  /** Default TTL in seconds for all entries (default: none). Use 0 to explicitly disable TTL on a specific set(). */
   defaultTtl?: number;
   /** Namespace prefix for all keys (default: none). Keys are stored as `${namespace}:${key}`. */
   namespace?: string;

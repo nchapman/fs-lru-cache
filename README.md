@@ -93,7 +93,7 @@ const cache = new FsLruCache({
   maxMemorySize: 50_000_000, // Max memory in bytes (default: 50MB)
   maxDiskSize: 500_000_000, // Max disk usage in bytes (default: 500MB)
   shards: 16, // Number of subdirectories (default: 16)
-  defaultTtl: 300_000, // Default TTL in ms for all entries (default: none)
+  defaultTtl: 300, // Default TTL in seconds for all entries (default: none)
   namespace: "myapp", // Key prefix for multi-tenant apps (default: none)
   gzip: true, // Enable gzip compression for disk (default: false)
   pruneInterval: 60000, // Auto-prune expired items every 60s (default: disabled)
@@ -106,7 +106,7 @@ Set a default expiration for all entries:
 
 ```typescript
 // All items expire after 5 minutes unless overridden
-const cache = new FsLruCache({ defaultTtl: 300_000 });
+const cache = new FsLruCache({ defaultTtl: 300 });
 
 await cache.set("key", "value"); // Expires in 5 minutes
 await cache.set("key2", "value", 60_000); // Override: expires in 1 minute

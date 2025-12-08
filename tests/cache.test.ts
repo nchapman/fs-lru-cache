@@ -1138,7 +1138,7 @@ describe("FsLruCache", () => {
 
   describe("defaultTtl", () => {
     it("should apply defaultTtl when no TTL is provided", async () => {
-      const ttlCache = createTestCache("default-ttl", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl", { defaultTtl: 5 });
       await ttlCache.set("key", "value");
 
       const ttl = await ttlCache.pttl("key");
@@ -1149,7 +1149,7 @@ describe("FsLruCache", () => {
     });
 
     it("should allow overriding defaultTtl with explicit TTL", async () => {
-      const ttlCache = createTestCache("default-ttl-override", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl-override", { defaultTtl: 5 });
       await ttlCache.set("key", "value", 1000);
 
       const ttl = await ttlCache.pttl("key");
@@ -1160,7 +1160,7 @@ describe("FsLruCache", () => {
     });
 
     it("should allow disabling TTL with 0", async () => {
-      const ttlCache = createTestCache("default-ttl-disable", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl-disable", { defaultTtl: 5 });
       await ttlCache.set("key", "value", 0);
 
       expect(await ttlCache.pttl("key")).toBe(-1);
@@ -1169,7 +1169,7 @@ describe("FsLruCache", () => {
     });
 
     it("should apply defaultTtl to setnx", async () => {
-      const ttlCache = createTestCache("default-ttl-setnx", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl-setnx", { defaultTtl: 5 });
       await ttlCache.setnx("key", "value");
 
       const ttl = await ttlCache.pttl("key");
@@ -1180,7 +1180,7 @@ describe("FsLruCache", () => {
     });
 
     it("should apply defaultTtl to getOrSet", async () => {
-      const ttlCache = createTestCache("default-ttl-getorset", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl-getorset", { defaultTtl: 5 });
       await ttlCache.getOrSet("key", () => "value");
 
       const ttl = await ttlCache.pttl("key");
@@ -1191,7 +1191,7 @@ describe("FsLruCache", () => {
     });
 
     it("should apply defaultTtl to mset", async () => {
-      const ttlCache = createTestCache("default-ttl-mset", { defaultTtl: 5000 });
+      const ttlCache = createTestCache("default-ttl-mset", { defaultTtl: 5 });
       await ttlCache.mset([
         ["a", 1],
         ["b", 2],
@@ -1204,7 +1204,7 @@ describe("FsLruCache", () => {
     });
 
     it("should expire items with defaultTtl", async () => {
-      const ttlCache = createTestCache("default-ttl-expire", { defaultTtl: 50 });
+      const ttlCache = createTestCache("default-ttl-expire", { defaultTtl: 0.05 });
       await ttlCache.set("key", "value");
 
       expect(await ttlCache.get("key")).toBe("value");
@@ -1347,7 +1347,7 @@ describe("FsLruCache", () => {
     it("should combine with defaultTtl", async () => {
       const combinedCache = createTestCache("namespace-defaultttl", {
         namespace: "app",
-        defaultTtl: 5000,
+        defaultTtl: 5,
       });
 
       await combinedCache.set("key", "value");
@@ -1505,7 +1505,7 @@ describe("FsLruCache", () => {
       const cache = createTestCache("compression-combined", {
         gzip: true,
         namespace: "app",
-        defaultTtl: 5000,
+        defaultTtl: 5,
       });
 
       await cache.set("key", "value");

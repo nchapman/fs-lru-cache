@@ -77,13 +77,13 @@ export class FsLruCache {
 
   /**
    * Resolve the TTL to use: explicit value, defaultTtl, or none.
-   * - undefined: use defaultTtl if set
+   * - undefined: use defaultTtl if set (converted from seconds to ms)
    * - 0: explicitly no TTL
    * - positive number: use that TTL
    */
   private resolveTtl(ttlMs?: number): number | undefined {
     if (ttlMs === undefined) {
-      return this.defaultTtl;
+      return this.defaultTtl ? this.defaultTtl * 1000 : undefined;
     }
     return ttlMs === 0 ? undefined : ttlMs;
   }
