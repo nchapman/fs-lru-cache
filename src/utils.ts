@@ -43,7 +43,8 @@ export function isExpired(expiresAt: number | null): boolean {
  */
 export function compilePattern(pattern: string): RegExp | null {
   if (pattern === "*") return null;
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  const collapsed = pattern.replace(/\*+/g, "*");
+  const escaped = collapsed.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
 }
 
