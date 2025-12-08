@@ -14,6 +14,7 @@ interface FileInfo {
   key: string;
   size: number;
   mtime: number;
+  expiresAt: number | null;
 }
 
 /**
@@ -285,15 +286,28 @@ export class FileStore {
   }
 
   /**
-   * Ensure we have space for new data by evicting LRU entries
+   * Ensure we have space for new data by evicting entries
+   * Priority: expired items first, then LRU (oldest mtime)
    */
   private async ensureSpace(needed: number): Promise<void> {
     const currentSize = await this.getSize();
     if (currentSize + needed <= this.maxSize) return;
 
-    // Get all files sorted by mtime (oldest first)
     const files = await this.getAllFiles();
-    files.sort((a, b) => a.mtime - b.mtime);
+    const now = Date.now();
+
+    // Sort: expired first, then by mtime (oldest first)
+    files.sort((a, b) => {
+      const aExpired = a.expiresAt !== null && a.expiresAt <= now;
+      const bExpired = b.expiresAt !== null && b.expiresAt <= now;
+
+      // Expired items come first
+      if (aExpired && !bExpired) return -1;
+      if (!aExpired && bExpired) return 1;
+
+      // Among same category, sort by mtime (oldest first)
+      return a.mtime - b.mtime;
+    });
 
     let freed = 0;
     const target = currentSize + needed - this.maxSize;
@@ -338,6 +352,7 @@ export class FileStore {
               key: data.key,
               size: stat.size,
               mtime: stat.mtimeMs,
+              expiresAt: data.expiresAt,
             });
           } catch {
             // Skip invalid files

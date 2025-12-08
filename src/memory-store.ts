@@ -74,7 +74,7 @@ export class MemoryStore {
       (this.cache.size >= this.maxItems || this.currentSize + size > this.maxSize) &&
       this.cache.size > 0
     ) {
-      this.evictOldest();
+      this.evictOne();
     }
 
     this.cache.set(key, entry);
@@ -181,9 +181,19 @@ export class MemoryStore {
   }
 
   /**
-   * Evict the oldest (least recently used) entry
+   * Evict an entry to make room for new data
+   * Priority: expired items first, then LRU
    */
-  private evictOldest(): void {
+  private evictOne(): void {
+    // First, try to find and remove an expired entry
+    for (const [key, entry] of this.cache) {
+      if (isExpired(entry.expiresAt)) {
+        this.delete(key);
+        return;
+      }
+    }
+
+    // No expired entries, fall back to LRU (oldest in map)
     const oldest = this.cache.keys().next().value;
     if (oldest !== undefined) {
       this.delete(oldest);

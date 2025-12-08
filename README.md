@@ -3,7 +3,7 @@
 A fast, Redis-like LRU cache for Node.js with file system persistence.
 
 - **Two-tier storage**: Hot data in memory, everything persisted to disk
-- **Redis-like API**: Familiar commands like `get`, `set`, `expire`, `incr`
+- **Redis-like API**: Familiar commands like `get`, `set`, `expire`, `mget`
 - **Zero dependencies**: Uses only Node.js built-ins
 - **TypeScript**: Full type definitions included
 
@@ -66,15 +66,6 @@ await cache.mset([                          // Set multiple values
 ])
 ```
 
-### Counters
-
-```typescript
-await cache.incr(key)                      // Increment by 1
-await cache.incrby(key, 5)                 // Increment by amount
-await cache.decr(key)                      // Decrement by 1
-await cache.decrby(key, 5)                 // Decrement by amount
-```
-
 ### Utilities
 
 ```typescript
@@ -112,23 +103,6 @@ const session = await sessions.get(`session:${id}`);
 
 // Extend session
 await sessions.expire(`session:${id}`, 86400);
-```
-
-### Rate Limiting
-
-```typescript
-const limits = new FsLruCache();
-
-async function checkRateLimit(ip: string): Promise<boolean> {
-  const key = `ratelimit:${ip}`;
-  const count = await limits.incr(key);
-
-  if (count === 1) {
-    await limits.expire(key, 60); // Reset after 1 minute
-  }
-
-  return count <= 100; // 100 requests per minute
-}
 ```
 
 ### Caching Database Queries
