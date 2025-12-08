@@ -22,6 +22,8 @@ export interface CacheOptions {
   defaultTtl?: number;
   /** Namespace prefix for all keys (default: none). Keys are stored as `${namespace}:${key}`. */
   namespace?: string;
+  /** Enable gzip compression for disk storage (default: false). Reduces disk usage at the cost of CPU. */
+  gzip?: boolean;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -67,4 +69,5 @@ export const DEFAULT_OPTIONS = {
   shards: 16,
   defaultTtl: undefined as number | undefined,
   namespace: undefined as string | undefined,
+  gzip: false,
 };

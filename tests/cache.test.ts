@@ -1274,6 +1274,167 @@ describe("FsLruCache", () => {
     });
   });
 
+  describe("gzip", () => {
+    it("should store and retrieve values with compression enabled", async () => {
+      const compressedCache = createTestCache("compression-basic", { gzip: true });
+      await compressedCache.set("key", "value");
+      expect(await compressedCache.get("key")).toBe("value");
+      await compressedCache.close();
+    });
+
+    it("should handle complex objects with compression", async () => {
+      const compressedCache = createTestCache("compression-objects", { gzip: true });
+      const obj = { name: "test", nested: { value: 123 }, arr: [1, 2, 3] };
+      await compressedCache.set("obj", obj);
+      expect(await compressedCache.get("obj")).toEqual(obj);
+      await compressedCache.close();
+    });
+
+    it("should reduce disk size for compressible data", async () => {
+      const uncompressed = createTestCache("compression-size-off", { gzip: false });
+      const compressed = createTestCache("compression-size-on", { gzip: true });
+
+      // Highly compressible data (repeated pattern)
+      const largeValue = "x".repeat(10000);
+
+      await uncompressed.set("key", largeValue);
+      await compressed.set("key", largeValue);
+
+      const uncompressedStats = await uncompressed.stats();
+      const compressedStats = await compressed.stats();
+
+      // Compressed should be significantly smaller
+      expect(compressedStats.disk.size).toBeLessThan(uncompressedStats.disk.size / 2);
+
+      await uncompressed.close();
+      await compressed.close();
+    });
+
+    it("should persist compressed data across restarts", async () => {
+      const cache1 = createTestCache("compression-persist", { gzip: true });
+      await cache1.set("key", { data: "test value" });
+      await cache1.close();
+
+      const cache2 = createTestCache("compression-persist", { gzip: true });
+      expect(await cache2.get("key")).toEqual({ data: "test value" });
+      await cache2.close();
+    });
+
+    it("should read uncompressed files when compression is enabled (migration)", async () => {
+      // Write without compression
+      const uncompressed = createTestCache("compression-migrate-to", { gzip: false });
+      await uncompressed.set("old-key", "old-value");
+      await uncompressed.close();
+
+      // Read with compression enabled
+      const compressed = createTestCache("compression-migrate-to", { gzip: true });
+      expect(await compressed.get("old-key")).toBe("old-value");
+
+      // New writes should be compressed
+      await compressed.set("new-key", "x".repeat(1000));
+      await compressed.close();
+    });
+
+    it("should read compressed files when compression is disabled (migration back)", async () => {
+      // Write with compression
+      const compressed = createTestCache("compression-migrate-from", { gzip: true });
+      await compressed.set("key", "value");
+      await compressed.close();
+
+      // Read without compression
+      const uncompressed = createTestCache("compression-migrate-from", { gzip: false });
+      expect(await uncompressed.get("key")).toBe("value");
+      await uncompressed.close();
+    });
+
+    it("should work with TTL operations", async () => {
+      const compressedCache = createTestCache("compression-ttl", { gzip: true });
+      await compressedCache.set("key", "value", 5000);
+
+      const ttl = await compressedCache.pttl("key");
+      expect(ttl).toBeGreaterThan(4000);
+      expect(ttl).toBeLessThanOrEqual(5000);
+
+      await compressedCache.pexpire("key", 10000);
+      expect(await compressedCache.pttl("key")).toBeGreaterThan(9000);
+
+      await compressedCache.persist("key");
+      expect(await compressedCache.pttl("key")).toBe(-1);
+
+      await compressedCache.close();
+    });
+
+    it("should work with touch", async () => {
+      const compressedCache = createTestCache("compression-touch", { gzip: true });
+      await compressedCache.set("key", "value");
+
+      expect(await compressedCache.touch("key", 5000)).toBe(true);
+      expect(await compressedCache.pttl("key")).toBeGreaterThan(4000);
+      expect(await compressedCache.get("key")).toBe("value");
+
+      await compressedCache.close();
+    });
+
+    it("should work with mget and mset", async () => {
+      const compressedCache = createTestCache("compression-multi", { gzip: true });
+      await compressedCache.mset([
+        ["a", 1],
+        ["b", 2],
+        ["c", 3],
+      ]);
+
+      expect(await compressedCache.mget(["a", "b", "c"])).toEqual([1, 2, 3]);
+      await compressedCache.close();
+    });
+
+    it("should work with getOrSet", async () => {
+      const compressedCache = createTestCache("compression-getorset", { gzip: true });
+      const result = await compressedCache.getOrSet("key", () => "computed");
+
+      expect(result).toBe("computed");
+      expect(await compressedCache.get("key")).toBe("computed");
+      await compressedCache.close();
+    });
+
+    it("should work with del and exists", async () => {
+      const compressedCache = createTestCache("compression-del", { gzip: true });
+      await compressedCache.set("key", "value");
+
+      expect(await compressedCache.exists("key")).toBe(true);
+      expect(await compressedCache.del("key")).toBe(true);
+      expect(await compressedCache.exists("key")).toBe(false);
+
+      await compressedCache.close();
+    });
+
+    it("should work with keys pattern matching", async () => {
+      const compressedCache = createTestCache("compression-keys", { gzip: true });
+      await compressedCache.set("user:1", "Alice");
+      await compressedCache.set("user:2", "Bob");
+      await compressedCache.set("post:1", "Hello");
+
+      expect((await compressedCache.keys("user:*")).sort()).toEqual(["user:1", "user:2"]);
+      await compressedCache.close();
+    });
+
+    it("should combine with namespace and defaultTtl", async () => {
+      const cache = createTestCache("compression-combined", {
+        gzip: true,
+        namespace: "app",
+        defaultTtl: 5000,
+      });
+
+      await cache.set("key", "value");
+      expect(await cache.get("key")).toBe("value");
+      expect(await cache.pttl("key")).toBeGreaterThan(4000);
+
+      const keys = await cache.keys();
+      expect(keys).toEqual(["key"]);
+
+      await cache.close();
+    });
+  });
+
   describe("disk eviction", () => {
     it("should evict expired entries first when disk is full", async () => {
       const smallCache = createTestCache("eviction", {

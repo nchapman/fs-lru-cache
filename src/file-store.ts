@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import { join } from "path";
 import { randomBytes } from "crypto";
+import { gzipSync, gunzipSync } from "zlib";
 import { CacheEntry } from "./types.js";
 import {
   hashKey,
@@ -11,10 +12,14 @@ import {
   matchPattern,
 } from "./utils.js";
 
+/** Gzip magic bytes for detecting compressed files */
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
+
 export interface FileStoreOptions {
   dir: string;
   shards: number;
   maxSize: number;
+  gzip?: boolean;
 }
 
 interface IndexEntry {
@@ -31,6 +36,7 @@ export class FileStore {
   private readonly dir: string;
   private readonly shards: number;
   private readonly maxSize: number;
+  private readonly gzip: boolean;
   private initialized = false;
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
@@ -43,6 +49,32 @@ export class FileStore {
     this.dir = options.dir;
     this.shards = options.shards;
     this.maxSize = options.maxSize;
+    this.gzip = options.gzip ?? false;
+  }
+
+  /**
+   * Check if a buffer is gzip compressed by looking for magic bytes.
+   */
+  private isCompressed(data: Buffer): boolean {
+    return data.length >= 2 && data[0] === GZIP_MAGIC[0] && data[1] === GZIP_MAGIC[1];
+  }
+
+  /**
+   * Compress data if compression is enabled.
+   */
+  private compress(data: string): Buffer {
+    const buffer = Buffer.from(data, "utf8");
+    return this.gzip ? gzipSync(buffer) : buffer;
+  }
+
+  /**
+   * Decompress data, auto-detecting if it's compressed.
+   */
+  private decompress(data: Buffer): string {
+    if (this.isCompressed(data)) {
+      return gunzipSync(data).toString("utf8");
+    }
+    return data.toString("utf8");
   }
 
   /**
@@ -97,7 +129,8 @@ export class FileStore {
     const filePath = join(shardDir, file);
 
     try {
-      const [stat, content] = await Promise.all([fs.stat(filePath), fs.readFile(filePath, "utf8")]);
+      const [stat, rawContent] = await Promise.all([fs.stat(filePath), fs.readFile(filePath)]);
+      const content = this.decompress(rawContent);
       const data: CacheEntry = JSON.parse(content);
 
       if (isExpired(data.expiresAt)) {
@@ -145,10 +178,10 @@ export class FileStore {
   /**
    * Atomic file write: write to temp, then rename
    */
-  private async atomicWrite(filePath: string, content: string): Promise<void> {
+  private async atomicWrite(filePath: string, content: Buffer): Promise<void> {
     const tempPath = this.getTempPath();
     try {
-      await fs.writeFile(tempPath, content, "utf8");
+      await fs.writeFile(tempPath, content);
       await fs.rename(tempPath, filePath);
     } catch (err) {
       await fs.unlink(tempPath).catch(() => {});
@@ -180,7 +213,8 @@ export class FileStore {
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
     try {
-      const content = await fs.readFile(filePath, "utf8");
+      const rawContent = await fs.readFile(filePath);
+      const content = this.decompress(rawContent);
       const entry: CacheEntry<T> = JSON.parse(content);
 
       // Verify key matches (hash collision check)
@@ -240,7 +274,8 @@ export class FileStore {
 
     const entry: CacheEntry<T> = { key, value, expiresAt };
     const serialized = content ?? JSON.stringify(entry);
-    const size = Buffer.byteLength(serialized, "utf8");
+    const compressed = this.compress(serialized);
+    const size = compressed.length;
     const hash = hashKey(key);
     const filePath = this.getFilePath(key);
 
@@ -262,7 +297,7 @@ export class FileStore {
     }
 
     await this.ensureSpace(size);
-    await this.atomicWrite(filePath, serialized);
+    await this.atomicWrite(filePath, compressed);
 
     this.index.set(key, {
       hash,
@@ -344,17 +379,19 @@ export class FileStore {
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
     try {
-      const content = await fs.readFile(filePath, "utf8");
+      const rawContent = await fs.readFile(filePath);
+      const content = this.decompress(rawContent);
       const entry: CacheEntry = JSON.parse(content);
 
       if (entry.key !== key) return false;
 
       entry.expiresAt = expiresAt;
       const serialized = JSON.stringify(entry);
-      await this.atomicWrite(filePath, serialized);
+      const compressed = this.compress(serialized);
+      await this.atomicWrite(filePath, compressed);
 
       // Update index
-      const newSize = Buffer.byteLength(serialized, "utf8");
+      const newSize = compressed.length;
       this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
       indexEntry.size = newSize;
@@ -397,17 +434,19 @@ export class FileStore {
       const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
       try {
-        const content = await fs.readFile(filePath, "utf8");
+        const rawContent = await fs.readFile(filePath);
+        const content = this.decompress(rawContent);
         const entry: CacheEntry = JSON.parse(content);
 
         if (entry.key !== key) return false;
 
         entry.expiresAt = expiresAt;
         const serialized = JSON.stringify(entry);
-        await this.atomicWrite(filePath, serialized);
+        const compressed = this.compress(serialized);
+        await this.atomicWrite(filePath, compressed);
 
         // Update index
-        const newSize = Buffer.byteLength(serialized, "utf8");
+        const newSize = compressed.length;
         this.totalSize += newSize - indexEntry.size;
         indexEntry.expiresAt = expiresAt;
         indexEntry.size = newSize;

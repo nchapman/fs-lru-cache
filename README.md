@@ -94,6 +94,7 @@ const cache = new FsLruCache({
   shards: 16, // Number of subdirectories (default: 16)
   defaultTtl: 300_000, // Default TTL in ms for all entries (default: none)
   namespace: "myapp", // Key prefix for multi-tenant apps (default: none)
+  gzip: true, // Enable gzip compression for disk (default: false)
 });
 ```
 
@@ -126,6 +127,25 @@ await postCache.set("456", { title: "Hello" });
 await userCache.get("123"); // { name: "Alice" }
 await postCache.get("123"); // null
 ```
+
+### Gzip Compression
+
+Enable gzip compression to reduce disk usage:
+
+```typescript
+const cache = new FsLruCache({ gzip: true });
+
+// Data is compressed on disk, transparent to your code
+await cache.set("key", "x".repeat(10000)); // Stored compressed
+await cache.get("key"); // Returns original string
+```
+
+Features:
+
+- Uses Node.js built-in zlib (no dependencies)
+- Auto-detects compressed vs uncompressed files
+- Seamless migration: enable compression anytime, old files still readable
+- Best for compressible data (text, JSON); less benefit for already-compressed data
 
 ## Examples
 

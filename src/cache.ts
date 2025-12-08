@@ -42,6 +42,7 @@ export class FsLruCache {
       dir: opts.dir,
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
+      gzip: opts.gzip,
     });
   }
 
