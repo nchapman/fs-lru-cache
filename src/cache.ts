@@ -76,6 +76,18 @@ export class FsLruCache {
   }
 
   /**
+   * Set a value only if the key does not exist
+   * @returns true if the key was set, false if it already existed
+   */
+  async setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean> {
+    if (await this.exists(key)) {
+      return false;
+    }
+    await this.set(key, value, ttlMs);
+    return true;
+  }
+
+  /**
    * Delete a key from the cache
    */
   async del(key: string): Promise<boolean> {
@@ -127,6 +139,17 @@ export class FsLruCache {
   }
 
   /**
+   * Remove the TTL from a key, making it persistent
+   * @returns true if TTL was removed, false if key doesn't exist
+   */
+  async persist(key: string): Promise<boolean> {
+    const memSuccess = this.memory.setExpiry(key, null);
+    const diskSuccess = await this.files.setExpiry(key, null);
+
+    return memSuccess || diskSuccess;
+  }
+
+  /**
    * Get TTL in seconds
    * Returns -1 if no expiry, -2 if key not found
    */
@@ -167,6 +190,27 @@ export class FsLruCache {
     await Promise.all(
       entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs))
     );
+  }
+
+  /**
+   * Get a value, or set it if it doesn't exist (cache-aside pattern)
+   * @param key The cache key
+   * @param fn Function that returns the value to cache (can be async)
+   * @param ttlMs Optional TTL in milliseconds
+   */
+  async getOrSet<T>(
+    key: string,
+    fn: () => T | Promise<T>,
+    ttlMs?: number
+  ): Promise<T> {
+    const existing = await this.get<T>(key);
+    if (existing !== null) {
+      return existing;
+    }
+
+    const value = await fn();
+    await this.set(key, value, ttlMs);
+    return value;
   }
 
   /**

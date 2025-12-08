@@ -521,4 +521,140 @@ describe('FsLruCache', () => {
       expect(result).toBe(7);
     });
   });
+
+  describe('setnx', () => {
+    it('should set value if key does not exist', async () => {
+      const result = await cache.setnx('key', 'value');
+      expect(result).toBe(true);
+      expect(await cache.get('key')).toBe('value');
+    });
+
+    it('should not set value if key exists', async () => {
+      await cache.set('key', 'original');
+      const result = await cache.setnx('key', 'new');
+      expect(result).toBe(false);
+      expect(await cache.get('key')).toBe('original');
+    });
+
+    it('should support TTL', async () => {
+      await cache.setnx('key', 'value', 1000);
+      const ttl = await cache.pttl('key');
+      expect(ttl).toBeGreaterThan(900);
+      expect(ttl).toBeLessThanOrEqual(1000);
+    });
+
+    it('should work after key expires', async () => {
+      await cache.set('key', 'old', 50);
+      await new Promise((r) => setTimeout(r, 60));
+
+      const result = await cache.setnx('key', 'new');
+      expect(result).toBe(true);
+      expect(await cache.get('key')).toBe('new');
+    });
+  });
+
+  describe('persist', () => {
+    it('should remove TTL from key', async () => {
+      await cache.set('key', 'value', 5000);
+      expect(await cache.pttl('key')).toBeGreaterThan(0);
+
+      const result = await cache.persist('key');
+      expect(result).toBe(true);
+      expect(await cache.pttl('key')).toBe(-1);
+    });
+
+    it('should return true for key without TTL', async () => {
+      await cache.set('key', 'value');
+      const result = await cache.persist('key');
+      expect(result).toBe(true);
+    });
+
+    it('should return false for non-existent key', async () => {
+      const result = await cache.persist('nonexistent');
+      expect(result).toBe(false);
+    });
+
+    it('should keep value after persist', async () => {
+      await cache.set('key', { data: 'test' }, 5000);
+      await cache.persist('key');
+      expect(await cache.get('key')).toEqual({ data: 'test' });
+    });
+  });
+
+  describe('getOrSet', () => {
+    it('should return existing value without calling fn', async () => {
+      await cache.set('key', 'existing');
+      let fnCalled = false;
+
+      const result = await cache.getOrSet('key', () => {
+        fnCalled = true;
+        return 'new';
+      });
+
+      expect(result).toBe('existing');
+      expect(fnCalled).toBe(false);
+    });
+
+    it('should call fn and cache result if key does not exist', async () => {
+      let fnCalled = false;
+
+      const result = await cache.getOrSet('key', () => {
+        fnCalled = true;
+        return 'computed';
+      });
+
+      expect(result).toBe('computed');
+      expect(fnCalled).toBe(true);
+      expect(await cache.get('key')).toBe('computed');
+    });
+
+    it('should support async fn', async () => {
+      const result = await cache.getOrSet('key', async () => {
+        await new Promise((r) => setTimeout(r, 10));
+        return 'async-value';
+      });
+
+      expect(result).toBe('async-value');
+      expect(await cache.get('key')).toBe('async-value');
+    });
+
+    it('should support TTL', async () => {
+      await cache.getOrSet('key', () => 'value', 1000);
+      const ttl = await cache.pttl('key');
+      expect(ttl).toBeGreaterThan(900);
+    });
+
+    it('should work with complex objects', async () => {
+      interface User { id: number; name: string }
+
+      const result = await cache.getOrSet<User>('user:1', () => ({
+        id: 1,
+        name: 'Alice',
+      }));
+
+      expect(result.id).toBe(1);
+      expect(result.name).toBe('Alice');
+    });
+
+    it('should call fn again after key expires', async () => {
+      let callCount = 0;
+
+      await cache.getOrSet('key', () => {
+        callCount++;
+        return `value-${callCount}`;
+      }, 50);
+
+      expect(callCount).toBe(1);
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      const result = await cache.getOrSet('key', () => {
+        callCount++;
+        return `value-${callCount}`;
+      });
+
+      expect(callCount).toBe(2);
+      expect(result).toBe('value-2');
+    });
+  });
 });
