@@ -1,7 +1,7 @@
-import { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from './types.js';
-import { MemoryStore } from './memory-store.js';
-import { FileStore } from './file-store.js';
-import { estimateSize } from './utils.js';
+import { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from "./types.js";
+import { MemoryStore } from "./memory-store.js";
+import { FileStore } from "./file-store.js";
+import { estimateSize } from "./utils.js";
 
 /**
  * FsLruCache - A Redis-like LRU cache with file system persistence.
@@ -43,7 +43,7 @@ export class FsLruCache {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new Error('Cache is closed');
+      throw new Error("Cache is closed");
     }
   }
 
@@ -51,10 +51,7 @@ export class FsLruCache {
    * Execute an operation with stampede protection.
    * Concurrent calls for the same key will share the same promise.
    */
-  private async withStampedeProtection<T>(
-    key: string,
-    operation: () => Promise<T>
-  ): Promise<T> {
+  private async withStampedeProtection<T>(key: string, operation: () => Promise<T>): Promise<T> {
     const existing = this.inFlight.get(key);
     if (existing) {
       return existing as Promise<T>;
@@ -113,7 +110,7 @@ export class FsLruCache {
     // Serialize once for both stores
     const entry: CacheEntry = { key, value, expiresAt };
     const serialized = JSON.stringify(entry);
-    const size = Buffer.byteLength(serialized, 'utf8');
+    const size = Buffer.byteLength(serialized, "utf8");
 
     // Write to disk first (ensures durability before memory)
     await this.files.set(key, value, expiresAt, serialized);
@@ -162,14 +159,14 @@ export class FsLruCache {
    */
   async exists(key: string): Promise<boolean> {
     this.assertOpen();
-    return this.memory.has(key) || await this.files.has(key);
+    return this.memory.has(key) || (await this.files.has(key));
   }
 
   /**
    * Get all keys matching a pattern.
    * @param pattern Glob-like pattern (supports * wildcard)
    */
-  async keys(pattern = '*'): Promise<string[]> {
+  async keys(pattern = "*"): Promise<string[]> {
     this.assertOpen();
 
     const [memKeys, diskKeys] = await Promise.all([
@@ -249,9 +246,7 @@ export class FsLruCache {
    * @param entries Array of [key, value] or [key, value, ttlMs] tuples
    */
   async mset(entries: [string, unknown, number?][]): Promise<void> {
-    await Promise.all(
-      entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs))
-    );
+    await Promise.all(entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs)));
   }
 
   /**
@@ -263,11 +258,7 @@ export class FsLruCache {
    * @param fn Function that computes the value to cache (can be async)
    * @param ttlMs Optional TTL in milliseconds
    */
-  async getOrSet<T>(
-    key: string,
-    fn: () => T | Promise<T>,
-    ttlMs?: number
-  ): Promise<T> {
+  async getOrSet<T>(key: string, fn: () => T | Promise<T>, ttlMs?: number): Promise<T> {
     this.assertOpen();
 
     // Fast path: check cache first

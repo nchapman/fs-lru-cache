@@ -1,2 +1,3 @@
-export { FsLruCache } from './cache.js';
-export { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from './types.js';
+export { FsLruCache } from "./cache.js";
+export type { CacheOptions, CacheEntry, CacheStats } from "./types.js";
+export { DEFAULT_OPTIONS } from "./types.js";

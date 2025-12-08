@@ -1,9 +1,9 @@
-import { promises as fs } from 'fs';
-import { join } from 'path';
-import { afterEach } from 'vitest';
-import { FsLruCache } from '../src/cache.js';
-import { FileStore } from '../src/file-store.js';
-import { CacheOptions } from '../src/types.js';
+import { promises as fs } from "fs";
+import { join } from "path";
+import { afterEach } from "vitest";
+import { FsLruCache } from "../src/cache.js";
+import { FileStore } from "../src/file-store.js";
+import { CacheOptions } from "../src/types.js";
 
 /** Base directory for all test caches */
 export const TEST_BASE = process.cwd();
@@ -43,7 +43,7 @@ afterEach(async () => {
  */
 export function createTestFileStore(
   name: string,
-  options: Partial<{ shards: number; maxSize: number }> = {}
+  options: Partial<{ shards: number; maxSize: number }> = {},
 ): FileStore {
   const dir = testDir(name);
   registerCleanup(dir);
@@ -57,10 +57,7 @@ export function createTestFileStore(
 /**
  * Create an FsLruCache for testing with automatic cleanup.
  */
-export function createTestCache(
-  name: string,
-  options: Partial<CacheOptions> = {}
-): FsLruCache {
+export function createTestCache(name: string, options: Partial<CacheOptions> = {}): FsLruCache {
   const dir = testDir(name);
   registerCleanup(dir);
   return new FsLruCache({

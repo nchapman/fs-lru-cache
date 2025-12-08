@@ -1,5 +1,5 @@
-import { MemoryEntry } from './types.js';
-import { estimateSize, isExpired, compilePattern, matchPattern } from './utils.js';
+import { MemoryEntry } from "./types.js";
+import { estimateSize, isExpired, compilePattern, matchPattern } from "./utils.js";
 
 export interface MemoryStoreOptions {
   maxItems: number;
@@ -98,7 +98,7 @@ export class MemoryStore {
   /**
    * Get all keys matching a pattern
    */
-  keys(pattern = '*'): string[] {
+  keys(pattern = "*"): string[] {
     const compiled = compilePattern(pattern);
     const result: string[] = [];
 
@@ -159,8 +159,10 @@ export class MemoryStore {
    * Check if eviction is needed to accommodate new data
    */
   private needsEviction(newSize: number): boolean {
-    return this.cache.size > 0 &&
-      (this.cache.size >= this.maxItems || this.currentSize + newSize > this.maxSize);
+    return (
+      this.cache.size > 0 &&
+      (this.cache.size >= this.maxItems || this.currentSize + newSize > this.maxSize)
+    );
   }
 
   /**

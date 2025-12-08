@@ -56,7 +56,7 @@ export interface CacheStats {
 }
 
 export const DEFAULT_OPTIONS: Required<CacheOptions> = {
-  dir: '.cache',
+  dir: ".cache",
   maxMemoryItems: 1000,
   maxMemorySize: 50 * 1024 * 1024, // 50MB
   maxDiskSize: 500 * 1024 * 1024, // 500MB

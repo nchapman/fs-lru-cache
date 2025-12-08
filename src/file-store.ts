@@ -1,8 +1,15 @@
-import { promises as fs } from 'fs';
-import { join } from 'path';
-import { randomBytes } from 'crypto';
-import { CacheEntry } from './types.js';
-import { hashKey, getShardIndex, getShardName, isExpired, compilePattern, matchPattern } from './utils.js';
+import { promises as fs } from "fs";
+import { join } from "path";
+import { randomBytes } from "crypto";
+import { CacheEntry } from "./types.js";
+import {
+  hashKey,
+  getShardIndex,
+  getShardName,
+  isExpired,
+  compilePattern,
+  matchPattern,
+} from "./utils.js";
 
 export interface FileStoreOptions {
   dir: string;
@@ -48,7 +55,7 @@ export class FileStore {
 
     // Create shard directories
     const shardPromises = Array.from({ length: this.shards }, (_, i) =>
-      fs.mkdir(join(this.dir, getShardName(i)), { recursive: true })
+      fs.mkdir(join(this.dir, getShardName(i)), { recursive: true }),
     );
     await Promise.all(shardPromises);
 
@@ -75,7 +82,7 @@ export class FileStore {
       }
 
       for (const file of files) {
-        if (!file.endsWith('.json')) continue;
+        if (!file.endsWith(".json")) continue;
         await this.loadFile(shardDir, file);
       }
     };
@@ -90,10 +97,7 @@ export class FileStore {
     const filePath = join(shardDir, file);
 
     try {
-      const [stat, content] = await Promise.all([
-        fs.stat(filePath),
-        fs.readFile(filePath, 'utf8'),
-      ]);
+      const [stat, content] = await Promise.all([fs.stat(filePath), fs.readFile(filePath, "utf8")]);
       const data: CacheEntry = JSON.parse(content);
 
       if (isExpired(data.expiresAt)) {
@@ -101,7 +105,7 @@ export class FileStore {
         return;
       }
 
-      const hash = file.replace('.json', '');
+      const hash = file.replace(".json", "");
       this.index.set(data.key, {
         hash,
         expiresAt: data.expiresAt,
@@ -135,7 +139,7 @@ export class FileStore {
    * Generate a temporary file path for atomic writes
    */
   private getTempPath(): string {
-    return join(this.dir, `.tmp-${randomBytes(8).toString('hex')}`);
+    return join(this.dir, `.tmp-${randomBytes(8).toString("hex")}`);
   }
 
   /**
@@ -144,7 +148,7 @@ export class FileStore {
   private async atomicWrite(filePath: string, content: string): Promise<void> {
     const tempPath = this.getTempPath();
     try {
-      await fs.writeFile(tempPath, content, 'utf8');
+      await fs.writeFile(tempPath, content, "utf8");
       await fs.rename(tempPath, filePath);
     } catch (err) {
       await fs.unlink(tempPath).catch(() => {});
@@ -171,12 +175,12 @@ export class FileStore {
    */
   private async readCacheFile<T>(
     key: string,
-    indexEntry: IndexEntry
+    indexEntry: IndexEntry,
   ): Promise<CacheEntry<T> | null> {
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
     try {
-      const content = await fs.readFile(filePath, 'utf8');
+      const content = await fs.readFile(filePath, "utf8");
       const entry: CacheEntry<T> = JSON.parse(content);
 
       // Verify key matches (hash collision check)
@@ -230,13 +234,13 @@ export class FileStore {
     key: string,
     value: T,
     expiresAt: number | null = null,
-    content?: string
+    content?: string,
   ): Promise<void> {
     await this.init();
 
     const entry: CacheEntry<T> = { key, value, expiresAt };
     const serialized = content ?? JSON.stringify(entry);
-    const size = Buffer.byteLength(serialized, 'utf8');
+    const size = Buffer.byteLength(serialized, "utf8");
     const hash = hashKey(key);
     const filePath = this.getFilePath(key);
 
@@ -305,7 +309,7 @@ export class FileStore {
   /**
    * Get all keys matching a pattern (fast - uses index)
    */
-  async keys(pattern = '*'): Promise<string[]> {
+  async keys(pattern = "*"): Promise<string[]> {
     await this.init();
 
     const compiled = compilePattern(pattern);
@@ -340,7 +344,7 @@ export class FileStore {
     const filePath = this.getFilePathFromHash(indexEntry.hash, key);
 
     try {
-      const content = await fs.readFile(filePath, 'utf8');
+      const content = await fs.readFile(filePath, "utf8");
       const entry: CacheEntry = JSON.parse(content);
 
       if (entry.key !== key) return false;
@@ -350,7 +354,7 @@ export class FileStore {
       await this.atomicWrite(filePath, serialized);
 
       // Update index
-      const newSize = Buffer.byteLength(serialized, 'utf8');
+      const newSize = Buffer.byteLength(serialized, "utf8");
       this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
       indexEntry.size = newSize;
@@ -384,9 +388,7 @@ export class FileStore {
       const shardDir = join(this.dir, getShardName(shardIndex));
       try {
         const files = await fs.readdir(shardDir);
-        await Promise.all(
-          files.map((file) => fs.unlink(join(shardDir, file)).catch(() => {}))
-        );
+        await Promise.all(files.map((file) => fs.unlink(join(shardDir, file)).catch(() => {})));
       } catch {
         // Ignore errors
       }

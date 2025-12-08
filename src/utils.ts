@@ -1,11 +1,11 @@
-import { createHash } from 'crypto';
+import { createHash } from "crypto";
 
 /**
  * Generate a hash for a cache key.
  * Returns a 32-character hex string (128 bits - collision resistant to ~2^64 keys)
  */
 export function hashKey(key: string): string {
-  return createHash('sha256').update(key).digest('hex').slice(0, 32);
+  return createHash("sha256").update(key).digest("hex").slice(0, 32);
 }
 
 /**
@@ -20,14 +20,14 @@ export function getShardIndex(key: string, shardCount: number): number {
  * Get shard directory name (2-char hex)
  */
 export function getShardName(index: number): string {
-  return index.toString(16).padStart(2, '0');
+  return index.toString(16).padStart(2, "0");
 }
 
 /**
  * Estimate byte size of a JSON-serializable value
  */
 export function estimateSize(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 /**
@@ -42,8 +42,8 @@ export function isExpired(expiresAt: number | null): boolean {
  * Returns null for '*' (match all) as an optimization.
  */
 export function compilePattern(pattern: string): RegExp | null {
-  if (pattern === '*') return null;
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  if (pattern === "*") return null;
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
 }
 
@@ -52,7 +52,7 @@ export function compilePattern(pattern: string): RegExp | null {
  * Accepts a pre-compiled RegExp, a string pattern, or null (match all).
  */
 export function matchPattern(key: string, pattern: string | RegExp | null): boolean {
-  if (pattern === null || pattern === '*') return true;
+  if (pattern === null || pattern === "*") return true;
   if (pattern instanceof RegExp) return pattern.test(key);
   return compilePattern(pattern)!.test(key);
 }
