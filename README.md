@@ -10,7 +10,7 @@ A fast LRU cache for Node.js with file system persistence.
 ## Installation
 
 ```bash
-npm install fs-lru-cache
+npm install github:nchapman/fs-lru-cache
 ```
 
 ## Quick Start
