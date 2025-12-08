@@ -4,7 +4,7 @@ import { FileStore } from "./file-store.js";
 import { estimateSize } from "./utils.js";
 
 /**
- * FsLruCache - A Redis-like LRU cache with file system persistence.
+ * FsLruCache - An LRU cache with file system persistence.
  *
  * Features:
  * - Two-tier storage: hot items in memory, all items on disk

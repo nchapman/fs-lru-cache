@@ -1,9 +1,9 @@
 # fs-lru-cache
 
-A fast, Redis-like LRU cache for Node.js with file system persistence.
+A fast LRU cache for Node.js with file system persistence.
 
 - **Two-tier storage**: Hot data in memory, everything persisted to disk
-- **Redis-like API**: Familiar commands like `get`, `set`, `expire`, `mget`
+- **Familiar API**: Common commands like `get`, `set`, `expire`, `mget`
 - **Zero dependencies**: Uses only Node.js built-ins
 - **TypeScript**: Full type definitions included
 

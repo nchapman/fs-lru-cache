@@ -1,7 +1,7 @@
 {
   "name": "fs-lru-cache",
   "version": "1.0.0",
-  "description": "A Redis-like LRU cache with file system persistence and in-memory hot cache",
+  "description": "A fast LRU cache with file system persistence and in-memory hot cache",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -28,7 +28,6 @@
     "cache",
     "lru",
     "filesystem",
-    "redis",
     "memcache",
     "storage"
   ],
