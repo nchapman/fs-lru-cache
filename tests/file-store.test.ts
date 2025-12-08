@@ -27,7 +27,8 @@ describe('FileStore', () => {
   describe('get/set', () => {
     it('should store and retrieve values', async () => {
       await store.set('key1', 'value1');
-      expect(await store.get('key1')).toBe('value1');
+      const entry = await store.get('key1');
+      expect(entry?.value).toBe('value1');
     });
 
     it('should return null for non-existent keys', async () => {
@@ -37,13 +38,15 @@ describe('FileStore', () => {
     it('should store complex objects', async () => {
       const obj = { name: 'test', nested: { value: 123 } };
       await store.set('obj', obj);
-      expect(await store.get('obj')).toEqual(obj);
+      const entry = await store.get('obj');
+      expect(entry?.value).toEqual(obj);
     });
 
     it('should overwrite existing values', async () => {
       await store.set('key', 'value1');
       await store.set('key', 'value2');
-      expect(await store.get('key')).toBe('value2');
+      const entry = await store.get('key');
+      expect(entry?.value).toBe('value2');
     });
 
     it('should create shard directories', async () => {
@@ -101,7 +104,8 @@ describe('FileStore', () => {
   describe('TTL', () => {
     it('should expire keys after TTL', async () => {
       await store.set('key', 'value', Date.now() + 50);
-      expect(await store.get('key')).toBe('value');
+      const entry = await store.get('key');
+      expect(entry?.value).toBe('value');
 
       await new Promise((r) => setTimeout(r, 60));
       expect(await store.get('key')).toBeNull();

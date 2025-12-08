@@ -1,6 +1,7 @@
-import { CacheOptions, CacheStats, DEFAULT_OPTIONS } from './types.js';
+import { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from './types.js';
 import { MemoryStore } from './memory-store.js';
 import { FileStore } from './file-store.js';
+import { estimateSize } from './utils.js';
 
 /**
  * FsLruCache - A Redis-like LRU cache with file system persistence
@@ -11,15 +12,22 @@ import { FileStore } from './file-store.js';
  * - Write-through to disk for durability
  * - LRU eviction in both memory and disk stores
  * - TTL support with lazy expiration
+ * - Stampede protection for getOrSet
  */
 export class FsLruCache {
   private readonly memory: MemoryStore;
   private readonly files: FileStore;
+  private readonly maxMemorySize: number;
   private hits = 0;
   private misses = 0;
 
+  // In-flight operations for stampede protection
+  private inFlight: Map<string, Promise<unknown>> = new Map();
+
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
+
+    this.maxMemorySize = opts.maxMemorySize;
 
     this.memory = new MemoryStore({
       maxItems: opts.maxMemoryItems,
@@ -45,16 +53,16 @@ export class FsLruCache {
       return memValue;
     }
 
-    // Check disk
-    const diskValue = await this.files.get<T>(key);
-    if (diskValue !== null) {
+    // Check disk - now returns full entry with expiresAt
+    const diskEntry = await this.files.get<T>(key);
+    if (diskEntry !== null) {
       this.hits++;
-      // Promote to memory
-      const entry = await this.files.peek(key);
-      if (entry) {
-        this.memory.set(key, diskValue, entry.expiresAt);
+      // Promote to memory (skip if too large for memory)
+      const size = estimateSize(diskEntry.value);
+      if (size <= this.maxMemorySize) {
+        this.memory.set(key, diskEntry.value, diskEntry.expiresAt);
       }
-      return diskValue;
+      return diskEntry.value;
     }
 
     this.misses++;
@@ -70,21 +78,49 @@ export class FsLruCache {
   async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
     const expiresAt = ttlMs ? Date.now() + ttlMs : null;
 
-    // Write to both stores
-    this.memory.set(key, value, expiresAt);
-    await this.files.set(key, value, expiresAt);
+    // Serialize once for both stores
+    const entry: CacheEntry = { key, value, expiresAt };
+    const serialized = JSON.stringify(entry);
+    const size = Buffer.byteLength(serialized, 'utf8');
+
+    // Write to memory (skip if too large)
+    if (size <= this.maxMemorySize) {
+      this.memory.set(key, value, expiresAt);
+    }
+
+    // Write to disk (atomic write, will throw on failure)
+    await this.files.set(key, value, expiresAt, serialized);
   }
 
   /**
-   * Set a value only if the key does not exist
+   * Set a value only if the key does not exist (atomic)
+   * Uses in-flight tracking to prevent race conditions
    * @returns true if the key was set, false if it already existed
    */
   async setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean> {
-    if (await this.exists(key)) {
-      return false;
+    // Check if operation is already in flight
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      await existing;
+      return false; // Someone else set it
     }
-    await this.set(key, value, ttlMs);
-    return true;
+
+    // Use IIFE pattern so inFlight is set BEFORE first await (prevents race)
+    const operation = (async () => {
+      if (await this.exists(key)) {
+        return false;
+      }
+      await this.set(key, value, ttlMs);
+      return true;
+    })();
+
+    this.inFlight.set(key, operation);
+
+    try {
+      return await operation;
+    } finally {
+      this.inFlight.delete(key);
+    }
   }
 
   /**
@@ -194,6 +230,9 @@ export class FsLruCache {
 
   /**
    * Get a value, or set it if it doesn't exist (cache-aside pattern)
+   * Includes stampede protection - concurrent calls for the same key
+   * will wait for the first call to complete instead of all executing fn()
+   *
    * @param key The cache key
    * @param fn Function that returns the value to cache (can be async)
    * @param ttlMs Optional TTL in milliseconds
@@ -203,14 +242,38 @@ export class FsLruCache {
     fn: () => T | Promise<T>,
     ttlMs?: number
   ): Promise<T> {
+    // Check cache first
     const existing = await this.get<T>(key);
     if (existing !== null) {
       return existing;
     }
 
-    const value = await fn();
-    await this.set(key, value, ttlMs);
-    return value;
+    // Check if computation is already in flight
+    const inFlightPromise = this.inFlight.get(key);
+    if (inFlightPromise) {
+      return inFlightPromise as Promise<T>;
+    }
+
+    // Compute value with stampede protection
+    const computePromise = (async () => {
+      // Double-check after acquiring "lock"
+      const recheck = await this.get<T>(key);
+      if (recheck !== null) {
+        return recheck;
+      }
+
+      const value = await fn();
+      await this.set(key, value, ttlMs);
+      return value;
+    })();
+
+    this.inFlight.set(key, computePromise);
+
+    try {
+      return await computePromise;
+    } finally {
+      this.inFlight.delete(key);
+    }
   }
 
   /**
@@ -261,7 +324,7 @@ export class FsLruCache {
    * Currently a no-op but included for API completeness
    */
   async close(): Promise<void> {
-    // No resources to clean up currently
-    // Future: could flush pending writes, etc.
+    // Clear in-flight operations
+    this.inFlight.clear();
   }
 }

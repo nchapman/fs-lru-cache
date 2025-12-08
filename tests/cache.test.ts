@@ -247,6 +247,31 @@ describe('FsLruCache', () => {
       expect(await cache.get('empty')).toBe('');
     });
 
+    it('should skip memory for oversized values but still persist to disk', async () => {
+      // Create cache with very small memory limit
+      const smallCache = new FsLruCache({
+        dir: TEST_DIR + '-oversized',
+        maxMemoryItems: 10,
+        maxMemorySize: 100, // 100 bytes
+        shards: 4,
+      });
+
+      // Store a value larger than maxMemorySize
+      const largeValue = 'x'.repeat(200);
+      await smallCache.set('large', largeValue);
+
+      // Value should be retrievable (from disk)
+      expect(await smallCache.get('large')).toBe(largeValue);
+
+      // Memory should be empty (value too large)
+      const stats = await smallCache.stats();
+      expect(stats.memory.items).toBe(0);
+      expect(stats.disk.items).toBe(1);
+
+      await smallCache.close();
+      await fs.rm(TEST_DIR + '-oversized', { recursive: true, force: true });
+    });
+
     it('should handle null values', async () => {
       await cache.set('null', null);
       expect(await cache.get('null')).toBeNull();
@@ -454,6 +479,24 @@ describe('FsLruCache', () => {
       expect(result).toBe(true);
       expect(await cache.get('key')).toBe('new');
     });
+
+    it('should only allow one concurrent caller to succeed', async () => {
+      // Launch 5 concurrent setnx calls for the same key
+      const results = await Promise.all([
+        cache.setnx('race-key', 'value-1'),
+        cache.setnx('race-key', 'value-2'),
+        cache.setnx('race-key', 'value-3'),
+        cache.setnx('race-key', 'value-4'),
+        cache.setnx('race-key', 'value-5'),
+      ]);
+
+      // Exactly one should succeed
+      const successes = results.filter((r) => r === true).length;
+      expect(successes).toBe(1);
+
+      // Key should exist
+      expect(await cache.exists('race-key')).toBe(true);
+    });
   });
 
   describe('persist', () => {
@@ -558,6 +601,38 @@ describe('FsLruCache', () => {
 
       expect(callCount).toBe(2);
       expect(result).toBe('value-2');
+    });
+
+    it('should provide stampede protection (only call fn once for concurrent requests)', async () => {
+      let callCount = 0;
+
+      // Simulate slow computation
+      const slowFn = async () => {
+        callCount++;
+        await new Promise((r) => setTimeout(r, 50));
+        return `computed-${callCount}`;
+      };
+
+      // Launch 5 concurrent getOrSet calls for the same key
+      const results = await Promise.all([
+        cache.getOrSet('expensive', slowFn),
+        cache.getOrSet('expensive', slowFn),
+        cache.getOrSet('expensive', slowFn),
+        cache.getOrSet('expensive', slowFn),
+        cache.getOrSet('expensive', slowFn),
+      ]);
+
+      // fn should only be called once (stampede protection)
+      expect(callCount).toBe(1);
+
+      // All results should be the same
+      expect(results).toEqual([
+        'computed-1',
+        'computed-1',
+        'computed-1',
+        'computed-1',
+        'computed-1',
+      ]);
     });
   });
 });

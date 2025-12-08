@@ -1,9 +1,18 @@
+/**
+ * Configuration options for FsLruCache
+ *
+ * @remarks
+ * **Known Limitations:**
+ * - `null` values cannot be distinguished from cache misses (both return `null`).
+ *   Use a sentinel value like `{ notFound: true }` to cache negative lookups.
+ * - Values must be JSON-serializable (no functions, undefined, circular refs).
+ */
 export interface CacheOptions {
   /** Cache directory path (default: ./.cache) */
   dir?: string;
   /** Maximum number of items in memory (default: 1000) */
   maxMemoryItems?: number;
-  /** Maximum memory usage in bytes (default: 50MB) */
+  /** Maximum memory usage in bytes (default: 50MB). Values larger than this skip the memory tier. */
   maxMemorySize?: number;
   /** Maximum disk usage in bytes (default: 500MB) */
   maxDiskSize?: number;

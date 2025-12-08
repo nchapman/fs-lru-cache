@@ -2,10 +2,10 @@ import { createHash } from 'crypto';
 
 /**
  * Generate a hash for a cache key
- * Returns a 16-character hex string
+ * Returns a 32-character hex string (128 bits - collision resistant to ~2^64 keys)
  */
 export function hashKey(key: string): string {
-  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return createHash('sha256').update(key).digest('hex').slice(0, 32);
 }
 
 /**
