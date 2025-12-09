@@ -1,6 +1,6 @@
 {
   "name": "fs-lru-cache",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A fast LRU cache with file system persistence and in-memory hot cache",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
