@@ -1,6 +1,12 @@
 import { createHash } from "crypto";
 
 /**
+ * A compiled pattern for efficient repeated matching.
+ * null means "match all" (*), RegExp is the compiled pattern.
+ */
+export type CompiledPattern = RegExp | null;
+
+/**
  * Generate a hash for a cache key.
  * Returns a 32-character hex string (128 bits - collision resistant to ~2^64 keys)
  */
@@ -33,7 +39,7 @@ export function isExpired(expiresAt: number | null): boolean {
  * Compile a glob pattern to a RegExp for efficient reuse.
  * Returns null for '*' (match all) as an optimization.
  */
-export function compilePattern(pattern: string): RegExp | null {
+export function compilePattern(pattern: string): CompiledPattern {
   if (pattern === "*") return null;
   const collapsed = pattern.replace(/\*+/g, "*");
   const escaped = collapsed.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");

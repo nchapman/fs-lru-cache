@@ -56,6 +56,7 @@ export function createTestFileStore(
 
 /**
  * Create an FsLruCache for testing with automatic cleanup.
+ * Uses syncWrites: true by default for deterministic test behavior.
  */
 export function createTestCache(name: string, options: Partial<CacheOptions> = {}): FsLruCache {
   const dir = testDir(name);
@@ -67,5 +68,6 @@ export function createTestCache(name: string, options: Partial<CacheOptions> = {
     maxDiskSize: options.maxDiskSize ?? 1024 * 1024,
     shards: options.shards ?? 4,
     ...options,
+    syncWrites: options.syncWrites ?? true, // Deterministic for tests (applied last to ensure it's not overridden)
   });
 }

@@ -28,7 +28,7 @@ npx vitest run -t "test name pattern"
 
 ## Architecture
 
-This is a two-tier LRU cache with file system persistence. The cache maintains hot data in memory while persisting everything to disk.
+This is a file system LRU cache with in-memory acceleration. Disk is the source of truth; memory acts as a hot cache for frequently accessed items.
 
 ### Core Components
 

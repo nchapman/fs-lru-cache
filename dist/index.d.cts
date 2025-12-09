@@ -27,6 +27,8 @@ interface CacheOptions {
   gzip?: boolean;
   /** Interval in milliseconds for automatic pruning of expired items (default: disabled). */
   pruneInterval?: number;
+  /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
+  syncWrites?: boolean;
 }
 interface CacheEntry<T = unknown> {
   /** The cache key */
@@ -55,6 +57,8 @@ interface CacheStats {
     items: number;
     size: number;
   };
+  /** Number of pending async disk writes */
+  pendingWrites: number;
 }
 declare const DEFAULT_OPTIONS: {
   dir: string;
@@ -66,6 +70,7 @@ declare const DEFAULT_OPTIONS: {
   namespace: string | undefined;
   gzip: boolean;
   pruneInterval: number | undefined;
+  syncWrites: boolean;
 };
 //#endregion
 //#region src/cache.d.ts
@@ -75,7 +80,7 @@ declare const DEFAULT_OPTIONS: {
  * Features:
  * - Two-tier storage: hot items in memory, all items on disk
  * - Memory-first reads for fast access to frequently used data
- * - Write-through to disk for durability
+ * - Async writes by default (memory updated immediately, disk in background)
  * - LRU eviction in both memory and disk stores
  * - TTL support with lazy expiration
  * - Stampede protection for concurrent operations
@@ -86,12 +91,21 @@ declare class FsLruCache {
   private readonly maxMemorySize;
   private readonly defaultTtl?;
   private readonly namespace?;
+  private readonly syncWrites;
   private hits;
   private misses;
   private closed;
   private inFlight;
+  /**
+   * Pending async disk writes per key.
+   * This is the primary source of truth for "intended state" during async writes.
+   * Contains the serialized value so reads can return it before disk write completes.
+   * Writes are chained: new writes wait for prior writes to the same key.
+   */
+  private pendingWrites;
   private pruneTimer?;
   private touchTimers;
+  private pendingTouches;
   private readonly touchDebounceMs;
   constructor(options?: CacheOptions);
   /**
@@ -117,9 +131,22 @@ declare class FsLruCache {
    */
   private debouncedFileTouch;
   /**
+   * Execute a touch and track the promise for flush().
+   */
+  private executeTouch;
+  /**
    * Cancel a pending debounced touch (used on delete/eviction).
    */
   private cancelDebouncedTouch;
+  /**
+   * Get a pending write if it exists and hasn't expired.
+   * Returns null if no pending write or if it's expired.
+   */
+  private getValidPendingWrite;
+  /**
+   * Get all pending write keys matching a pattern.
+   */
+  private getPendingWriteKeys;
   /**
    * Execute an operation with stampede protection.
    * Concurrent calls for the same key will share the same promise.
@@ -127,7 +154,8 @@ declare class FsLruCache {
   private withStampedeProtection;
   /**
    * Get a value from the cache.
-   * Checks memory first, then disk (promoting to memory on hit).
+   * Checks pending writes first, then memory, then disk.
+   * This ensures read-after-write consistency even with async writes.
    */
   get<T = unknown>(key: string): Promise<T | null>;
   /**
@@ -143,10 +171,12 @@ declare class FsLruCache {
   del(key: string): Promise<boolean>;
   /**
    * Check if a key exists in the cache.
+   * Checks pending writes first for consistency with async writes.
    */
   exists(key: string): Promise<boolean>;
   /**
    * Get all keys matching a pattern.
+   * Includes keys with pending writes for consistency.
    * @param pattern Glob-like pattern (supports * wildcard)
    */
   keys(pattern?: string): Promise<string[]>;
@@ -170,6 +200,7 @@ declare class FsLruCache {
   /**
    * Get TTL in seconds.
    * Returns -1 if no expiry, -2 if key not found.
+   * Checks pending writes first for consistency.
    */
   ttl(key: string): Promise<number>;
   /**
@@ -195,7 +226,7 @@ declare class FsLruCache {
   getOrSet<T>(key: string, fn: () => T | Promise<T>, ttl?: number): Promise<T>;
   /**
    * Get the total number of items in the cache.
-   * This is the count of items on disk (source of truth).
+   * Includes items with pending writes that haven't completed yet.
    */
   size(): Promise<number>;
   /**
@@ -206,6 +237,8 @@ declare class FsLruCache {
   prune(): Promise<number>;
   /**
    * Get cache statistics.
+   * Note: During async writes, disk stats may lag behind the actual state.
+   * Use flush() first if you need accurate post-write statistics.
    */
   stats(): Promise<CacheStats>;
   /**
@@ -213,11 +246,17 @@ declare class FsLruCache {
    */
   resetStats(): void;
   /**
+   * Wait for all pending async writes and touches to complete.
+   * Useful when you need to ensure data is persisted before reading stats or shutting down.
+   */
+  flush(): Promise<void>;
+  /**
    * Clear all entries from the cache.
    */
   clear(): Promise<void>;
   /**
    * Close the cache.
+   * Waits for pending writes to complete before closing.
    * After closing, all operations will throw.
    */
   close(): Promise<void>;
