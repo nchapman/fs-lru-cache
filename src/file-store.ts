@@ -1,8 +1,12 @@
 import { promises as fs } from "fs";
 import { join } from "path";
 import { randomBytes } from "crypto";
-import { gzipSync, gunzipSync } from "zlib";
+import { gzip, gunzip } from "zlib";
+import { promisify } from "util";
 import { CacheEntry } from "./types.js";
+
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 import {
   hashKey,
   getShardIndex,
@@ -73,17 +77,18 @@ export class FileStore {
   /**
    * Compress data if compression is enabled.
    */
-  private compress(data: string): Buffer {
+  private async compress(data: string): Promise<Buffer> {
     const buffer = Buffer.from(data, "utf8");
-    return this.gzip ? gzipSync(buffer) : buffer;
+    return this.gzip ? gzipAsync(buffer) : buffer;
   }
 
   /**
    * Decompress data, auto-detecting if it's compressed.
    */
-  private decompress(data: Buffer): string {
+  private async decompress(data: Buffer): Promise<string> {
     if (this.isCompressed(data)) {
-      return gunzipSync(data).toString("utf8");
+      const decompressed = await gunzipAsync(data);
+      return decompressed.toString("utf8");
     }
     return data.toString("utf8");
   }
@@ -141,7 +146,7 @@ export class FileStore {
 
     try {
       const [stat, rawContent] = await Promise.all([fs.stat(filePath), fs.readFile(filePath)]);
-      const content = this.decompress(rawContent);
+      const content = await this.decompress(rawContent);
       const data: CacheEntry = JSON.parse(content);
 
       if (isExpired(data.expiresAt)) {
@@ -225,7 +230,7 @@ export class FileStore {
 
     try {
       const rawContent = await fs.readFile(filePath);
-      const content = this.decompress(rawContent);
+      const content = await this.decompress(rawContent);
       const entry: CacheEntry<T> = JSON.parse(content);
 
       // Verify key matches (hash collision check)
@@ -283,9 +288,9 @@ export class FileStore {
   ): Promise<void> {
     await this.init();
 
-    const entry: CacheEntry<T> = { key, value, expiresAt };
-    const serialized = content ?? JSON.stringify(entry);
-    const compressed = this.compress(serialized);
+    // Use pre-serialized content if provided, otherwise serialize now
+    const serialized = content ?? JSON.stringify({ key, value, expiresAt } as CacheEntry<T>);
+    const compressed = await this.compress(serialized);
     const size = compressed.length;
     const hash = hashKey(key);
     const filePath = this.getFilePath(key);
@@ -397,14 +402,14 @@ export class FileStore {
 
     try {
       const rawContent = await fs.readFile(filePath);
-      const content = this.decompress(rawContent);
+      const content = await this.decompress(rawContent);
       const entry: CacheEntry = JSON.parse(content);
 
       if (entry.key !== key) return false;
 
       entry.expiresAt = expiresAt;
       const serialized = JSON.stringify(entry);
-      const compressed = this.compress(serialized);
+      const compressed = await this.compress(serialized);
       await this.atomicWrite(filePath, compressed);
 
       // Update index
@@ -452,14 +457,14 @@ export class FileStore {
 
       try {
         const rawContent = await fs.readFile(filePath);
-        const content = this.decompress(rawContent);
+        const content = await this.decompress(rawContent);
         const entry: CacheEntry = JSON.parse(content);
 
         if (entry.key !== key) return false;
 
         entry.expiresAt = expiresAt;
         const serialized = JSON.stringify(entry);
-        const compressed = this.compress(serialized);
+        const compressed = await this.compress(serialized);
         await this.atomicWrite(filePath, compressed);
 
         // Update index

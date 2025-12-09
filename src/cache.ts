@@ -160,13 +160,21 @@ export class FsLruCache {
 
     const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 
-    // Serialize value for memory store
+    // Serialize value once, reuse for both memory and disk
     const valueSerialized = JSON.stringify(value);
+
+    // Guard against non-JSON-serializable values (undefined, functions, symbols)
+    // JSON.stringify returns undefined for these, which would produce invalid JSON
+    if (valueSerialized === undefined) {
+      throw new TypeError(
+        `Cannot cache value of type ${typeof value}. Value must be JSON-serializable.`,
+      );
+    }
+
     const valueSize = Buffer.byteLength(valueSerialized, "utf8");
 
-    // Serialize full entry for disk store
-    const entry: CacheEntry = { key: prefixedKey, value, expiresAt };
-    const entrySerialized = JSON.stringify(entry);
+    // Build disk entry JSON using already-serialized value (avoids double serialization)
+    const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
 
     // Write to disk first (ensures durability before memory)
     await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
@@ -344,10 +352,45 @@ export class FsLruCache {
 
   /**
    * Set multiple key-value pairs at once.
+   * Optimized to batch serialization and disk writes.
    * @param entries Array of [key, value] or [key, value, ttlMs] tuples
    */
   async mset(entries: [string, unknown, number?][]): Promise<void> {
-    await Promise.all(entries.map(([key, value, ttlMs]) => this.set(key, value, ttlMs)));
+    this.assertOpen();
+    if (entries.length === 0) return;
+
+    // Phase 1: Prepare all entries (serialization)
+    const prepared = entries.map(([key, value, ttlMs]) => {
+      const prefixedKey = this.prefixKey(key);
+      const resolvedTtl = this.resolveTtl(ttlMs);
+      const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
+
+      const valueSerialized = JSON.stringify(value);
+
+      // Guard against non-JSON-serializable values
+      if (valueSerialized === undefined) {
+        throw new TypeError(
+          `Cannot cache value of type ${typeof value} for key "${key}". Value must be JSON-serializable.`,
+        );
+      }
+
+      const valueSize = Buffer.byteLength(valueSerialized, "utf8");
+      const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
+
+      return { prefixedKey, value, expiresAt, valueSerialized, valueSize, entrySerialized };
+    });
+
+    // Phase 2: Write all to disk in parallel
+    await Promise.all(
+      prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)),
+    );
+
+    // Phase 3: Update memory (fast, synchronous operations)
+    for (const p of prepared) {
+      if (p.valueSize <= this.maxMemorySize) {
+        this.memory.set(p.prefixedKey, p.valueSerialized, p.expiresAt);
+      }
+    }
   }
 
   /**
