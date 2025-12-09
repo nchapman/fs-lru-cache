@@ -27,10 +27,9 @@ function hashKey(key) {
 	return (0, crypto.createHash)("sha256").update(key).digest("hex").slice(0, 32);
 }
 /**
-* Get the shard index for a key
+* Get the shard index from a hash
 */
-function getShardIndex(key, shardCount) {
-	const hash = hashKey(key);
+function getShardIndex(hash, shardCount) {
 	return parseInt(hash.slice(0, 8), 16) % shardCount;
 }
 /**
@@ -165,13 +164,12 @@ var MemoryStore = class {
 		return true;
 	}
 	/**
-	* Touch a key: promote to most recently used and optionally update TTL.
+	* Touch a key: promote to most recently used.
 	* Does not read or return the value.
 	*/
-	touch(key, expiresAt) {
+	touch(key) {
 		const entry = this.getValidEntry(key);
 		if (!entry) return false;
-		if (expiresAt !== void 0) entry.expiresAt = expiresAt;
 		this.cache.delete(key);
 		this.cache.set(key, entry);
 		return true;
@@ -341,17 +339,10 @@ var FileStore = class {
 		} catch {}
 	}
 	/**
-	* Get the file path for a key
+	* Get the file path for a hash
 	*/
-	getFilePath(key) {
-		const shardName = getShardName(getShardIndex(key, this.shards));
-		return (0, path.join)(this.dir, shardName, `${hashKey(key)}.json`);
-	}
-	/**
-	* Get the file path using a hash directly
-	*/
-	getFilePathFromHash(hash, key) {
-		const shardName = getShardName(getShardIndex(key, this.shards));
+	getFilePath(hash) {
+		const shardName = getShardName(getShardIndex(hash, this.shards));
 		return (0, path.join)(this.dir, shardName, `${hash}.json`);
 	}
 	/**
@@ -389,7 +380,7 @@ var FileStore = class {
 	* Read and parse a cache file, handling errors and key mismatches
 	*/
 	async readCacheFile(key, indexEntry) {
-		const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+		const filePath = this.getFilePath(indexEntry.hash);
 		try {
 			const rawContent = await fs.promises.readFile(filePath);
 			const content = await this.decompress(rawContent);
@@ -402,6 +393,7 @@ var FileStore = class {
 		} catch {
 			this.totalSize -= indexEntry.size;
 			this.index.delete(key);
+			this.hashToKey.delete(indexEntry.hash);
 			return null;
 		}
 	}
@@ -440,7 +432,7 @@ var FileStore = class {
 		const compressed = await this.compress(serialized);
 		const size = compressed.length;
 		const hash = hashKey(key);
-		const filePath = this.getFilePath(key);
+		const filePath = this.getFilePath(hash);
 		const existing = this.index.get(key);
 		if (existing) {
 			this.totalSize -= existing.size;
@@ -475,7 +467,7 @@ var FileStore = class {
 		await this.init();
 		const indexEntry = this.index.get(key);
 		if (!indexEntry) return false;
-		const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+		const filePath = this.getFilePath(indexEntry.hash);
 		this.totalSize -= indexEntry.size;
 		this.index.delete(key);
 		this.hashToKey.delete(indexEntry.hash);
@@ -513,7 +505,7 @@ var FileStore = class {
 		await this.init();
 		const indexEntry = await this.getValidIndexEntry(key);
 		if (!indexEntry) return false;
-		const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+		const filePath = this.getFilePath(indexEntry.hash);
 		try {
 			const rawContent = await fs.promises.readFile(filePath);
 			const content = await this.decompress(rawContent);
@@ -544,34 +536,20 @@ var FileStore = class {
 		return Math.max(0, indexEntry.expiresAt - Date.now());
 	}
 	/**
-	* Touch a key: update last accessed time and optionally update TTL.
-	* If expiresAt is provided, rewrites the file with new expiry.
-	* If not provided, only updates the in-memory index (fast path).
+	* Touch a key: update last accessed time for LRU tracking.
+	* Updates both the in-memory index and file mtime (for restart persistence).
 	*/
-	async touch(key, expiresAt) {
+	async touch(key) {
 		await this.init();
 		const indexEntry = await this.getValidIndexEntry(key);
 		if (!indexEntry) return false;
-		indexEntry.lastAccessedAt = Date.now();
-		if (expiresAt !== void 0) {
-			const filePath = this.getFilePathFromHash(indexEntry.hash, key);
-			try {
-				const rawContent = await fs.promises.readFile(filePath);
-				const content = await this.decompress(rawContent);
-				const entry = JSON.parse(content);
-				if (entry.key !== key) return false;
-				entry.expiresAt = expiresAt;
-				const serialized = JSON.stringify(entry);
-				const compressed = await this.compress(serialized);
-				await this.atomicWrite(filePath, compressed);
-				const newSize = compressed.length;
-				this.totalSize += newSize - indexEntry.size;
-				indexEntry.expiresAt = expiresAt;
-				indexEntry.size = newSize;
-			} catch {
-				return false;
-			}
-		}
+		const filePath = this.getFilePath(indexEntry.hash);
+		const now = Date.now();
+		indexEntry.lastAccessedAt = now;
+		try {
+			const nowDate = new Date(now);
+			await fs.promises.utimes(filePath, nowDate, nowDate);
+		} catch {}
 		return true;
 	}
 	/**
@@ -657,7 +635,7 @@ var FileStore = class {
 	async evictKey(key) {
 		const entry = this.index.get(key);
 		if (!entry) return 0;
-		const filePath = this.getFilePathFromHash(entry.hash, key);
+		const filePath = this.getFilePath(entry.hash);
 		const freedSize = entry.size;
 		this.totalSize -= entry.size;
 		this.index.delete(key);
@@ -696,6 +674,8 @@ var FsLruCache = class {
 	closed = false;
 	inFlight = /* @__PURE__ */ new Map();
 	pruneTimer;
+	touchTimers = /* @__PURE__ */ new Map();
+	touchDebounceMs = 5e3;
 	constructor(options = {}) {
 		const opts = {
 			...DEFAULT_OPTIONS,
@@ -713,7 +693,10 @@ var FsLruCache = class {
 			shards: opts.shards,
 			maxSize: opts.maxDiskSize,
 			gzip: opts.gzip,
-			onEvict: (key) => this.memory.delete(key)
+			onEvict: (key) => {
+				this.memory.delete(key);
+				this.cancelDebouncedTouch(key);
+			}
 		});
 		if (opts.pruneInterval && opts.pruneInterval > 0) {
 			this.pruneTimer = setInterval(() => {
@@ -749,6 +732,29 @@ var FsLruCache = class {
 		if (this.closed) throw new Error("Cache is closed");
 	}
 	/**
+	* Schedule a debounced touch for the file store.
+	* Coalesces frequent accesses to reduce disk I/O.
+	*/
+	debouncedFileTouch(key) {
+		if (this.touchTimers.has(key)) return;
+		const timer = setTimeout(() => {
+			this.touchTimers.delete(key);
+			if (!this.closed) this.files.touch(key).catch(() => {});
+		}, this.touchDebounceMs);
+		timer.unref();
+		this.touchTimers.set(key, timer);
+	}
+	/**
+	* Cancel a pending debounced touch (used on delete/eviction).
+	*/
+	cancelDebouncedTouch(key) {
+		const timer = this.touchTimers.get(key);
+		if (timer) {
+			clearTimeout(timer);
+			this.touchTimers.delete(key);
+		}
+	}
+	/**
 	* Execute an operation with stampede protection.
 	* Concurrent calls for the same key will share the same promise.
 	*/
@@ -773,6 +779,7 @@ var FsLruCache = class {
 		const memSerialized = this.memory.get(prefixedKey);
 		if (memSerialized !== null) {
 			this.hits++;
+			this.debouncedFileTouch(prefixedKey);
 			return JSON.parse(memSerialized);
 		}
 		const diskEntry = await this.files.get(prefixedKey);
@@ -827,6 +834,7 @@ var FsLruCache = class {
 	async del(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		this.cancelDebouncedTouch(prefixedKey);
 		const memDeleted = this.memory.delete(prefixedKey);
 		const diskDeleted = await this.files.delete(prefixedKey);
 		return memDeleted || diskDeleted;
@@ -878,18 +886,17 @@ var FsLruCache = class {
 		return true;
 	}
 	/**
-	* Touch a key: refresh its position in the LRU and optionally update TTL.
+	* Touch a key: refresh its position in the LRU.
 	* This is more efficient than get() when you don't need the value.
+	* To update TTL, use expire() or pexpire() instead.
 	* @param key The cache key
-	* @param ttlMs Optional new TTL in milliseconds
 	* @returns true if key exists, false otherwise
 	*/
-	async touch(key, ttlMs) {
+	async touch(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
-		const expiresAt = ttlMs !== void 0 ? Date.now() + ttlMs : void 0;
-		if (!await this.files.touch(prefixedKey, expiresAt)) return false;
-		this.memory.touch(prefixedKey, expiresAt);
+		if (!await this.files.touch(prefixedKey)) return false;
+		this.memory.touch(prefixedKey);
 		return true;
 	}
 	/**
@@ -1020,6 +1027,8 @@ var FsLruCache = class {
 	*/
 	async clear() {
 		this.assertOpen();
+		for (const timer of this.touchTimers.values()) clearTimeout(timer);
+		this.touchTimers.clear();
 		this.memory.clear();
 		await this.files.clear();
 	}
@@ -1032,6 +1041,8 @@ var FsLruCache = class {
 			clearInterval(this.pruneTimer);
 			this.pruneTimer = void 0;
 		}
+		for (const timer of this.touchTimers.values()) clearTimeout(timer);
+		this.touchTimers.clear();
 		this.closed = true;
 		this.inFlight.clear();
 	}

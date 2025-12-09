@@ -23,7 +23,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "bench": "tsx benchmark.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "release": "./release.sh"
   },
   "keywords": [
     "cache",
