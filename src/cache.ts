@@ -86,15 +86,16 @@ export class FsLruCache {
 
   /**
    * Resolve the TTL to use: explicit value, defaultTtl, or none.
-   * - undefined: use defaultTtl if set (converted from seconds to ms)
+   * - undefined: use defaultTtl if set
    * - 0: explicitly no TTL
-   * - positive number: use that TTL
+   * - positive number: use that TTL (in seconds)
+   * Returns milliseconds for internal use.
    */
-  private resolveTtl(ttlMs?: number): number | undefined {
-    if (ttlMs === undefined) {
+  private resolveTtl(ttlSeconds?: number): number | undefined {
+    if (ttlSeconds === undefined) {
       return this.defaultTtl ? this.defaultTtl * 1000 : undefined;
     }
-    return ttlMs === 0 ? undefined : ttlMs;
+    return ttlSeconds === 0 ? undefined : ttlSeconds * 1000;
   }
 
   private assertOpen(): void {
@@ -189,12 +190,12 @@ export class FsLruCache {
    * Set a value in the cache.
    * @param key The cache key
    * @param value The value to store (must be JSON-serializable)
-   * @param ttlMs Optional TTL in milliseconds (0 to explicitly disable defaultTtl)
+   * @param ttl Optional TTL in seconds (0 to explicitly disable defaultTtl)
    */
-  async set(key: string, value: unknown, ttlMs?: number): Promise<void> {
+  async set(key: string, value: unknown, ttl?: number): Promise<void> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
-    const resolvedTtl = this.resolveTtl(ttlMs);
+    const resolvedTtl = this.resolveTtl(ttl);
 
     const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 
@@ -221,30 +222,6 @@ export class FsLruCache {
     if (valueSize <= this.maxMemorySize) {
       this.memory.set(prefixedKey, valueSerialized, expiresAt);
     }
-  }
-
-  /**
-   * Set a value only if the key does not exist (atomic).
-   * @returns true if the key was set, false if it already existed
-   */
-  async setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean> {
-    this.assertOpen();
-    const prefixedKey = this.prefixKey(key);
-
-    // Check if already in flight - if so, wait and report not set
-    const existing = this.inFlight.get(prefixedKey);
-    if (existing) {
-      await existing;
-      return false;
-    }
-
-    return this.withStampedeProtection(prefixedKey, async () => {
-      if (await this.exists(key)) {
-        return false;
-      }
-      await this.set(key, value, ttlMs);
-      return true;
-    });
   }
 
   /**
@@ -292,16 +269,9 @@ export class FsLruCache {
    * Set expiration time in seconds.
    */
   async expire(key: string, seconds: number): Promise<boolean> {
-    return this.pexpire(key, seconds * 1000);
-  }
-
-  /**
-   * Set expiration time in milliseconds.
-   */
-  async pexpire(key: string, ms: number): Promise<boolean> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
-    const expiresAt = Date.now() + ms;
+    const expiresAt = Date.now() + seconds * 1000;
 
     // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.setExpiry(prefixedKey, expiresAt);
@@ -360,23 +330,15 @@ export class FsLruCache {
    * Returns -1 if no expiry, -2 if key not found.
    */
   async ttl(key: string): Promise<number> {
-    const pttl = await this.pttl(key);
-    return pttl < 0 ? pttl : Math.ceil(pttl / 1000);
-  }
-
-  /**
-   * Get TTL in milliseconds.
-   * Returns -1 if no expiry, -2 if key not found.
-   */
-  async pttl(key: string): Promise<number> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
-    const memTtl = this.memory.getTtl(prefixedKey);
-    if (memTtl !== -2) {
-      return memTtl;
+    const memTtlMs = this.memory.getTtl(prefixedKey);
+    if (memTtlMs !== -2) {
+      return memTtlMs < 0 ? memTtlMs : Math.ceil(memTtlMs / 1000);
     }
-    return this.files.getTtl(prefixedKey);
+    const fileTtlMs = await this.files.getTtl(prefixedKey);
+    return fileTtlMs < 0 ? fileTtlMs : Math.ceil(fileTtlMs / 1000);
   }
 
   /**
@@ -390,16 +352,16 @@ export class FsLruCache {
   /**
    * Set multiple key-value pairs at once.
    * Optimized to batch serialization and disk writes.
-   * @param entries Array of [key, value] or [key, value, ttlMs] tuples
+   * @param entries Array of [key, value] or [key, value, ttl?] tuples (ttl in seconds)
    */
   async mset(entries: [string, unknown, number?][]): Promise<void> {
     this.assertOpen();
     if (entries.length === 0) return;
 
     // Phase 1: Prepare all entries (serialization)
-    const prepared = entries.map(([key, value, ttlMs]) => {
+    const prepared = entries.map(([key, value, ttl]) => {
       const prefixedKey = this.prefixKey(key);
-      const resolvedTtl = this.resolveTtl(ttlMs);
+      const resolvedTtl = this.resolveTtl(ttl);
       const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 
       const valueSerialized = JSON.stringify(value);
@@ -437,9 +399,9 @@ export class FsLruCache {
    *
    * @param key The cache key
    * @param fn Function that computes the value to cache (can be async)
-   * @param ttlMs Optional TTL in milliseconds
+   * @param ttl Optional TTL in seconds
    */
-  async getOrSet<T>(key: string, fn: () => T | Promise<T>, ttlMs?: number): Promise<T> {
+  async getOrSet<T>(key: string, fn: () => T | Promise<T>, ttl?: number): Promise<T> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
@@ -457,7 +419,7 @@ export class FsLruCache {
       }
 
       const value = await fn();
-      await this.set(key, value, ttlMs);
+      await this.set(key, value, ttl);
       return value;
     });
   }
