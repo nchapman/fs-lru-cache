@@ -29,6 +29,10 @@ export class FsLruCache {
   // Background prune interval
   private pruneTimer?: ReturnType<typeof setInterval>;
 
+  // Debounced touch timers for file store LRU updates
+  private touchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly touchDebounceMs = 5000;
+
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
     this.maxMemorySize = opts.maxMemorySize;
@@ -47,7 +51,10 @@ export class FsLruCache {
       gzip: opts.gzip,
       // Keep memory in sync: when disk evicts a key, remove from memory too.
       // This ensures memory is always a subset of disk (source of truth).
-      onEvict: (key) => this.memory.delete(key),
+      onEvict: (key) => {
+        this.memory.delete(key);
+        this.cancelDebouncedTouch(key);
+      },
     });
 
     // Start background pruning if configured
@@ -97,6 +104,35 @@ export class FsLruCache {
   }
 
   /**
+   * Schedule a debounced touch for the file store.
+   * Coalesces frequent accesses to reduce disk I/O.
+   */
+  private debouncedFileTouch(key: string): void {
+    if (this.touchTimers.has(key)) return;
+
+    const timer = setTimeout(() => {
+      this.touchTimers.delete(key);
+      if (!this.closed) {
+        this.files.touch(key).catch(() => {});
+      }
+    }, this.touchDebounceMs);
+
+    timer.unref();
+    this.touchTimers.set(key, timer);
+  }
+
+  /**
+   * Cancel a pending debounced touch (used on delete/eviction).
+   */
+  private cancelDebouncedTouch(key: string): void {
+    const timer = this.touchTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      this.touchTimers.delete(key);
+    }
+  }
+
+  /**
    * Execute an operation with stampede protection.
    * Concurrent calls for the same key will share the same promise.
    */
@@ -128,10 +164,12 @@ export class FsLruCache {
     const memSerialized = this.memory.get(prefixedKey);
     if (memSerialized !== null) {
       this.hits++;
+      // Update file store LRU (debounced to reduce I/O)
+      this.debouncedFileTouch(prefixedKey);
       return JSON.parse(memSerialized) as T;
     }
 
-    // Check disk
+    // Check disk (file store updates its own LRU on get)
     const diskEntry = await this.files.get<T>(prefixedKey);
     if (diskEntry !== null) {
       this.hits++;
@@ -215,6 +253,7 @@ export class FsLruCache {
   async del(key: string): Promise<boolean> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
+    this.cancelDebouncedTouch(prefixedKey);
     const memDeleted = this.memory.delete(prefixedKey);
     const diskDeleted = await this.files.delete(prefixedKey);
     return memDeleted || diskDeleted;
@@ -295,26 +334,24 @@ export class FsLruCache {
   }
 
   /**
-   * Touch a key: refresh its position in the LRU and optionally update TTL.
+   * Touch a key: refresh its position in the LRU.
    * This is more efficient than get() when you don't need the value.
+   * To update TTL, use expire() or pexpire() instead.
    * @param key The cache key
-   * @param ttlMs Optional new TTL in milliseconds
    * @returns true if key exists, false otherwise
    */
-  async touch(key: string, ttlMs?: number): Promise<boolean> {
+  async touch(key: string): Promise<boolean> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
-    const expiresAt = ttlMs !== undefined ? Date.now() + ttlMs : undefined;
-
-    // Disk first - if this fails, don't update memory (keeps them consistent)
-    const diskSuccess = await this.files.touch(prefixedKey, expiresAt);
+    // Disk first - if this fails, key doesn't exist
+    const diskSuccess = await this.files.touch(prefixedKey);
     if (!diskSuccess) {
       return false;
     }
 
     // Memory second - best effort (memory is just a hot cache)
-    this.memory.touch(prefixedKey, expiresAt);
+    this.memory.touch(prefixedKey);
     return true;
   }
 
@@ -490,6 +527,11 @@ export class FsLruCache {
    */
   async clear(): Promise<void> {
     this.assertOpen();
+    // Cancel all pending debounced touches
+    for (const timer of this.touchTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.touchTimers.clear();
     this.memory.clear();
     await this.files.clear();
   }
@@ -503,6 +545,11 @@ export class FsLruCache {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
+    // Clear all pending touch timers
+    for (const timer of this.touchTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.touchTimers.clear();
     this.closed = true;
     this.inFlight.clear();
   }
