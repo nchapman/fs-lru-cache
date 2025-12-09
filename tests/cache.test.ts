@@ -729,12 +729,14 @@ describe("FsLruCache", () => {
       expect(await cache.touch("nonexistent")).toBe(false);
     });
 
-    it("should update TTL when provided", async () => {
-      await cache.set("key", "value", 1000);
-      await cache.touch("key", 5000);
+    it("should not change TTL (use pexpire for TTL updates)", async () => {
+      await cache.set("key", "value", 5000);
+      await delay(100);
+      await cache.touch("key");
       const ttl = await cache.pttl("key");
+      // TTL should be unchanged (minus elapsed time)
       expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      expect(ttl).toBeLessThan(5000);
     });
 
     it("should preserve TTL when not provided", async () => {
@@ -748,7 +750,7 @@ describe("FsLruCache", () => {
 
     it("should preserve value", async () => {
       await cache.set("key", { data: "test" });
-      await cache.touch("key", 5000);
+      await cache.touch("key");
       expect(await cache.get("key")).toEqual({ data: "test" });
     });
 
@@ -780,22 +782,24 @@ describe("FsLruCache", () => {
     it("should work on keys only in disk", async () => {
       const smallCache = createTestCache("touch-disk", { maxMemoryItems: 1, shards: 2 });
 
-      await smallCache.set("disk-only", "value");
+      await smallCache.set("disk-only", "value", 5000);
       await smallCache.set("in-memory", "value2"); // Evicts disk-only from memory
 
-      expect(await smallCache.touch("disk-only", 5000)).toBe(true);
+      expect(await smallCache.touch("disk-only")).toBe(true);
+      // TTL should be preserved
       expect(await smallCache.pttl("disk-only")).toBeGreaterThan(4000);
 
       await smallCache.close();
     });
 
-    it("should persist TTL changes to disk", async () => {
-      await cache.set("key", "value", 1000);
-      await cache.touch("key", 10000);
+    it("should persist LRU update to disk via mtime", async () => {
+      await cache.set("key", "value", 10000);
+      await cache.touch("key");
       await cache.close();
 
       const dir = testDir("integration");
       const newCache = new FsLruCache({ dir, shards: 4 });
+      // TTL should be preserved (touch doesn't change TTL)
       expect(await newCache.pttl("key")).toBeGreaterThan(9000);
       await newCache.close();
 
@@ -1345,9 +1349,10 @@ describe("FsLruCache", () => {
 
     it("should work with touch", async () => {
       const nsCache = createTestCache("namespace-touch", { namespace: "app" });
-      await nsCache.set("key", "value");
+      await nsCache.set("key", "value", 5000);
 
-      expect(await nsCache.touch("key", 5000)).toBe(true);
+      expect(await nsCache.touch("key")).toBe(true);
+      // TTL should be preserved
       expect(await nsCache.pttl("key")).toBeGreaterThan(4000);
 
       await nsCache.close();
@@ -1492,9 +1497,10 @@ describe("FsLruCache", () => {
 
     it("should work with touch", async () => {
       const compressedCache = createTestCache("compression-touch", { gzip: true });
-      await compressedCache.set("key", "value");
+      await compressedCache.set("key", "value", 5000);
 
-      expect(await compressedCache.touch("key", 5000)).toBe(true);
+      expect(await compressedCache.touch("key")).toBe(true);
+      // TTL should be preserved
       expect(await compressedCache.pttl("key")).toBeGreaterThan(4000);
       expect(await compressedCache.get("key")).toBe("value");
 

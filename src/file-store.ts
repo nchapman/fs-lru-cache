@@ -169,18 +169,10 @@ export class FileStore {
   }
 
   /**
-   * Get the file path for a key
+   * Get the file path for a hash
    */
-  private getFilePath(key: string): string {
-    const shardName = getShardName(getShardIndex(key, this.shards));
-    return join(this.dir, shardName, `${hashKey(key)}.json`);
-  }
-
-  /**
-   * Get the file path using a hash directly
-   */
-  private getFilePathFromHash(hash: string, key: string): string {
-    const shardName = getShardName(getShardIndex(key, this.shards));
+  private getFilePath(hash: string): string {
+    const shardName = getShardName(getShardIndex(hash, this.shards));
     return join(this.dir, shardName, `${hash}.json`);
   }
 
@@ -226,7 +218,7 @@ export class FileStore {
     key: string,
     indexEntry: IndexEntry,
   ): Promise<CacheEntry<T> | null> {
-    const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+    const filePath = this.getFilePath(indexEntry.hash);
 
     try {
       const rawContent = await fs.readFile(filePath);
@@ -240,9 +232,10 @@ export class FileStore {
       }
       return entry;
     } catch {
-      // File missing or corrupted
+      // File missing or corrupted - clean up index
       this.totalSize -= indexEntry.size;
       this.index.delete(key);
+      this.hashToKey.delete(indexEntry.hash);
       return null;
     }
   }
@@ -293,7 +286,7 @@ export class FileStore {
     const compressed = await this.compress(serialized);
     const size = compressed.length;
     const hash = hashKey(key);
-    const filePath = this.getFilePath(key);
+    const filePath = this.getFilePath(hash);
 
     // Remove old entry if exists
     const existing = this.index.get(key);
@@ -340,7 +333,7 @@ export class FileStore {
     const indexEntry = this.index.get(key);
     if (!indexEntry) return false;
 
-    const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+    const filePath = this.getFilePath(indexEntry.hash);
 
     // Update index first (before I/O)
     this.totalSize -= indexEntry.size;
@@ -398,7 +391,7 @@ export class FileStore {
     const indexEntry = await this.getValidIndexEntry(key);
     if (!indexEntry) return false;
 
-    const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+    const filePath = this.getFilePath(indexEntry.hash);
 
     try {
       const rawContent = await fs.readFile(filePath);
@@ -438,43 +431,25 @@ export class FileStore {
   }
 
   /**
-   * Touch a key: update last accessed time and optionally update TTL.
-   * If expiresAt is provided, rewrites the file with new expiry.
-   * If not provided, only updates the in-memory index (fast path).
+   * Touch a key: update last accessed time for LRU tracking.
+   * Updates both the in-memory index and file mtime (for restart persistence).
    */
-  async touch(key: string, expiresAt?: number | null): Promise<boolean> {
+  async touch(key: string): Promise<boolean> {
     await this.init();
 
     const indexEntry = await this.getValidIndexEntry(key);
     if (!indexEntry) return false;
 
-    // Always update last accessed time
-    indexEntry.lastAccessedAt = Date.now();
+    const filePath = this.getFilePath(indexEntry.hash);
+    const now = Date.now();
 
-    // If new expiry provided, need to rewrite file
-    if (expiresAt !== undefined) {
-      const filePath = this.getFilePathFromHash(indexEntry.hash, key);
+    indexEntry.lastAccessedAt = now;
 
-      try {
-        const rawContent = await fs.readFile(filePath);
-        const content = await this.decompress(rawContent);
-        const entry: CacheEntry = JSON.parse(content);
-
-        if (entry.key !== key) return false;
-
-        entry.expiresAt = expiresAt;
-        const serialized = JSON.stringify(entry);
-        const compressed = await this.compress(serialized);
-        await this.atomicWrite(filePath, compressed);
-
-        // Update index
-        const newSize = compressed.length;
-        this.totalSize += newSize - indexEntry.size;
-        indexEntry.expiresAt = expiresAt;
-        indexEntry.size = newSize;
-      } catch {
-        return false;
-      }
+    try {
+      const nowDate = new Date(now);
+      await fs.utimes(filePath, nowDate, nowDate);
+    } catch {
+      // File may be gone, but index update still valid for this session
     }
 
     return true;
@@ -596,7 +571,7 @@ export class FileStore {
     const entry = this.index.get(key);
     if (!entry) return 0;
 
-    const filePath = this.getFilePathFromHash(entry.hash, key);
+    const filePath = this.getFilePath(entry.hash);
     const freedSize = entry.size;
 
     this.totalSize -= entry.size;

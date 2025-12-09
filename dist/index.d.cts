@@ -91,6 +91,8 @@ declare class FsLruCache {
   private closed;
   private inFlight;
   private pruneTimer?;
+  private touchTimers;
+  private readonly touchDebounceMs;
   constructor(options?: CacheOptions);
   /**
    * Prefix a key with the namespace if configured.
@@ -108,6 +110,15 @@ declare class FsLruCache {
    */
   private resolveTtl;
   private assertOpen;
+  /**
+   * Schedule a debounced touch for the file store.
+   * Coalesces frequent accesses to reduce disk I/O.
+   */
+  private debouncedFileTouch;
+  /**
+   * Cancel a pending debounced touch (used on delete/eviction).
+   */
+  private cancelDebouncedTouch;
   /**
    * Execute an operation with stampede protection.
    * Concurrent calls for the same key will share the same promise.
@@ -157,13 +168,13 @@ declare class FsLruCache {
    */
   persist(key: string): Promise<boolean>;
   /**
-   * Touch a key: refresh its position in the LRU and optionally update TTL.
+   * Touch a key: refresh its position in the LRU.
    * This is more efficient than get() when you don't need the value.
+   * To update TTL, use expire() or pexpire() instead.
    * @param key The cache key
-   * @param ttlMs Optional new TTL in milliseconds
    * @returns true if key exists, false otherwise
    */
-  touch(key: string, ttlMs?: number): Promise<boolean>;
+  touch(key: string): Promise<boolean>;
   /**
    * Get TTL in seconds.
    * Returns -1 if no expiry, -2 if key not found.
