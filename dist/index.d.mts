@@ -104,9 +104,10 @@ declare class FsLruCache {
   private unprefixKey;
   /**
    * Resolve the TTL to use: explicit value, defaultTtl, or none.
-   * - undefined: use defaultTtl if set (converted from seconds to ms)
+   * - undefined: use defaultTtl if set
    * - 0: explicitly no TTL
-   * - positive number: use that TTL
+   * - positive number: use that TTL (in seconds)
+   * Returns milliseconds for internal use.
    */
   private resolveTtl;
   private assertOpen;
@@ -133,14 +134,9 @@ declare class FsLruCache {
    * Set a value in the cache.
    * @param key The cache key
    * @param value The value to store (must be JSON-serializable)
-   * @param ttlMs Optional TTL in milliseconds (0 to explicitly disable defaultTtl)
+   * @param ttl Optional TTL in seconds (0 to explicitly disable defaultTtl)
    */
-  set(key: string, value: unknown, ttlMs?: number): Promise<void>;
-  /**
-   * Set a value only if the key does not exist (atomic).
-   * @returns true if the key was set, false if it already existed
-   */
-  setnx(key: string, value: unknown, ttlMs?: number): Promise<boolean>;
+  set(key: string, value: unknown, ttl?: number): Promise<void>;
   /**
    * Delete a key from the cache.
    */
@@ -158,10 +154,6 @@ declare class FsLruCache {
    * Set expiration time in seconds.
    */
   expire(key: string, seconds: number): Promise<boolean>;
-  /**
-   * Set expiration time in milliseconds.
-   */
-  pexpire(key: string, ms: number): Promise<boolean>;
   /**
    * Remove the TTL from a key, making it persistent.
    * @returns true if TTL was removed, false if key doesn't exist
@@ -181,11 +173,6 @@ declare class FsLruCache {
    */
   ttl(key: string): Promise<number>;
   /**
-   * Get TTL in milliseconds.
-   * Returns -1 if no expiry, -2 if key not found.
-   */
-  pttl(key: string): Promise<number>;
-  /**
    * Get multiple values at once.
    * Returns array in same order as keys (null for missing/expired).
    */
@@ -193,7 +180,7 @@ declare class FsLruCache {
   /**
    * Set multiple key-value pairs at once.
    * Optimized to batch serialization and disk writes.
-   * @param entries Array of [key, value] or [key, value, ttlMs] tuples
+   * @param entries Array of [key, value] or [key, value, ttl?] tuples (ttl in seconds)
    */
   mset(entries: [string, unknown, number?][]): Promise<void>;
   /**
@@ -203,9 +190,9 @@ declare class FsLruCache {
    *
    * @param key The cache key
    * @param fn Function that computes the value to cache (can be async)
-   * @param ttlMs Optional TTL in milliseconds
+   * @param ttl Optional TTL in seconds
    */
-  getOrSet<T>(key: string, fn: () => T | Promise<T>, ttlMs?: number): Promise<T>;
+  getOrSet<T>(key: string, fn: () => T | Promise<T>, ttl?: number): Promise<T>;
   /**
    * Get the total number of items in the cache.
    * This is the count of items on disk (source of truth).

@@ -720,13 +720,14 @@ var FsLruCache = class {
 	}
 	/**
 	* Resolve the TTL to use: explicit value, defaultTtl, or none.
-	* - undefined: use defaultTtl if set (converted from seconds to ms)
+	* - undefined: use defaultTtl if set
 	* - 0: explicitly no TTL
-	* - positive number: use that TTL
+	* - positive number: use that TTL (in seconds)
+	* Returns milliseconds for internal use.
 	*/
-	resolveTtl(ttlMs) {
-		if (ttlMs === void 0) return this.defaultTtl ? this.defaultTtl * 1e3 : void 0;
-		return ttlMs === 0 ? void 0 : ttlMs;
+	resolveTtl(ttlSeconds) {
+		if (ttlSeconds === void 0) return this.defaultTtl ? this.defaultTtl * 1e3 : void 0;
+		return ttlSeconds === 0 ? void 0 : ttlSeconds * 1e3;
 	}
 	assertOpen() {
 		if (this.closed) throw new Error("Cache is closed");
@@ -796,12 +797,12 @@ var FsLruCache = class {
 	* Set a value in the cache.
 	* @param key The cache key
 	* @param value The value to store (must be JSON-serializable)
-	* @param ttlMs Optional TTL in milliseconds (0 to explicitly disable defaultTtl)
+	* @param ttl Optional TTL in seconds (0 to explicitly disable defaultTtl)
 	*/
-	async set(key, value, ttlMs) {
+	async set(key, value, ttl) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
-		const resolvedTtl = this.resolveTtl(ttlMs);
+		const resolvedTtl = this.resolveTtl(ttl);
 		const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 		const valueSerialized = JSON.stringify(value);
 		if (valueSerialized === void 0) throw new TypeError(`Cannot cache value of type ${typeof value}. Value must be JSON-serializable.`);
@@ -809,24 +810,6 @@ var FsLruCache = class {
 		const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
 		await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
 		if (valueSize <= this.maxMemorySize) this.memory.set(prefixedKey, valueSerialized, expiresAt);
-	}
-	/**
-	* Set a value only if the key does not exist (atomic).
-	* @returns true if the key was set, false if it already existed
-	*/
-	async setnx(key, value, ttlMs) {
-		this.assertOpen();
-		const prefixedKey = this.prefixKey(key);
-		const existing = this.inFlight.get(prefixedKey);
-		if (existing) {
-			await existing;
-			return false;
-		}
-		return this.withStampedeProtection(prefixedKey, async () => {
-			if (await this.exists(key)) return false;
-			await this.set(key, value, ttlMs);
-			return true;
-		});
 	}
 	/**
 	* Delete a key from the cache.
@@ -861,15 +844,9 @@ var FsLruCache = class {
 	* Set expiration time in seconds.
 	*/
 	async expire(key, seconds) {
-		return this.pexpire(key, seconds * 1e3);
-	}
-	/**
-	* Set expiration time in milliseconds.
-	*/
-	async pexpire(key, ms) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
-		const expiresAt = Date.now() + ms;
+		const expiresAt = Date.now() + seconds * 1e3;
 		if (!await this.files.setExpiry(prefixedKey, expiresAt)) return false;
 		this.memory.setExpiry(prefixedKey, expiresAt);
 		return true;
@@ -904,19 +881,12 @@ var FsLruCache = class {
 	* Returns -1 if no expiry, -2 if key not found.
 	*/
 	async ttl(key) {
-		const pttl = await this.pttl(key);
-		return pttl < 0 ? pttl : Math.ceil(pttl / 1e3);
-	}
-	/**
-	* Get TTL in milliseconds.
-	* Returns -1 if no expiry, -2 if key not found.
-	*/
-	async pttl(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
-		const memTtl = this.memory.getTtl(prefixedKey);
-		if (memTtl !== -2) return memTtl;
-		return this.files.getTtl(prefixedKey);
+		const memTtlMs = this.memory.getTtl(prefixedKey);
+		if (memTtlMs !== -2) return memTtlMs < 0 ? memTtlMs : Math.ceil(memTtlMs / 1e3);
+		const fileTtlMs = await this.files.getTtl(prefixedKey);
+		return fileTtlMs < 0 ? fileTtlMs : Math.ceil(fileTtlMs / 1e3);
 	}
 	/**
 	* Get multiple values at once.
@@ -928,14 +898,14 @@ var FsLruCache = class {
 	/**
 	* Set multiple key-value pairs at once.
 	* Optimized to batch serialization and disk writes.
-	* @param entries Array of [key, value] or [key, value, ttlMs] tuples
+	* @param entries Array of [key, value] or [key, value, ttl?] tuples (ttl in seconds)
 	*/
 	async mset(entries) {
 		this.assertOpen();
 		if (entries.length === 0) return;
-		const prepared = entries.map(([key, value, ttlMs]) => {
+		const prepared = entries.map(([key, value, ttl]) => {
 			const prefixedKey = this.prefixKey(key);
-			const resolvedTtl = this.resolveTtl(ttlMs);
+			const resolvedTtl = this.resolveTtl(ttl);
 			const expiresAt = resolvedTtl ? Date.now() + resolvedTtl : null;
 			const valueSerialized = JSON.stringify(value);
 			if (valueSerialized === void 0) throw new TypeError(`Cannot cache value of type ${typeof value} for key "${key}". Value must be JSON-serializable.`);
@@ -958,9 +928,9 @@ var FsLruCache = class {
 	*
 	* @param key The cache key
 	* @param fn Function that computes the value to cache (can be async)
-	* @param ttlMs Optional TTL in milliseconds
+	* @param ttl Optional TTL in seconds
 	*/
-	async getOrSet(key, fn, ttlMs) {
+	async getOrSet(key, fn, ttl) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
 		const cached = await this.get(key);
@@ -969,7 +939,7 @@ var FsLruCache = class {
 			const recheck = await this.get(key);
 			if (recheck !== null) return recheck;
 			const value = await fn();
-			await this.set(key, value, ttlMs);
+			await this.set(key, value, ttl);
 			return value;
 		});
 	}
