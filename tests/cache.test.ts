@@ -116,14 +116,14 @@ describe("FsLruCache", () => {
 
   describe("TTL", () => {
     it("should set TTL on set()", async () => {
-      await cache.set("key", "value", 1000);
-      const ttl = await cache.pttl("key");
-      expect(ttl).toBeGreaterThan(900);
-      expect(ttl).toBeLessThanOrEqual(1000);
+      await cache.set("key", "value", 5);
+      const ttl = await cache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
     });
 
     it("should expire keys after TTL", async () => {
-      await cache.set("key", "value", 50);
+      await cache.set("key", "value", 0.05); // 50ms
       expect(await cache.get("key")).toBe("value");
       await delay(60);
       expect(await cache.get("key")).toBeNull();
@@ -137,38 +137,17 @@ describe("FsLruCache", () => {
       expect(ttl).toBeLessThanOrEqual(2);
     });
 
-    it("should support pexpire() in milliseconds", async () => {
-      await cache.set("key", "value");
-      await cache.pexpire("key", 2000);
-      const ttl = await cache.pttl("key");
-      expect(ttl).toBeGreaterThan(1900);
-      expect(ttl).toBeLessThanOrEqual(2000);
-    });
-
-    it("should return -1 for keys without expiry (ttl)", async () => {
+    it("should return -1 for keys without expiry", async () => {
       await cache.set("key", "value");
       expect(await cache.ttl("key")).toBe(-1);
     });
 
-    it("should return -2 for non-existent keys (ttl)", async () => {
+    it("should return -2 for non-existent keys", async () => {
       expect(await cache.ttl("nonexistent")).toBe(-2);
-    });
-
-    it("should return -1 for keys without expiry (pttl)", async () => {
-      await cache.set("key", "value");
-      expect(await cache.pttl("key")).toBe(-1);
-    });
-
-    it("should return -2 for non-existent keys (pttl)", async () => {
-      expect(await cache.pttl("nonexistent")).toBe(-2);
     });
 
     it("expire() should return false for non-existent keys", async () => {
       expect(await cache.expire("nonexistent", 10)).toBe(false);
-    });
-
-    it("pexpire() should return false for non-existent keys", async () => {
-      expect(await cache.pexpire("nonexistent", 10000)).toBe(false);
     });
   });
 
@@ -195,12 +174,12 @@ describe("FsLruCache", () => {
     });
 
     it("should persist TTL across cache instances", async () => {
-      await cache.set("expiring", "data", 5000);
+      await cache.set("expiring", "data", 5);
       await cache.close();
 
       const dir = testDir("integration");
       const newCache = new FsLruCache({ dir, shards: 4 });
-      expect(await newCache.pttl("expiring")).toBeGreaterThan(4000);
+      expect(await newCache.ttl("expiring")).toBeGreaterThanOrEqual(4);
       await newCache.close();
     });
   });
@@ -295,33 +274,33 @@ describe("FsLruCache", () => {
       const testCache = createTestCache("ttl-both", { maxMemoryItems: 10, shards: 2 });
 
       await testCache.set("key", "value");
-      expect(await testCache.pttl("key")).toBe(-1);
+      expect(await testCache.ttl("key")).toBe(-1);
 
-      await testCache.pexpire("key", 5000);
-      const ttl = await testCache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      await testCache.expire("key", 5);
+      const ttl = await testCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
 
       await testCache.close();
       const dir = testDir("ttl-both");
       const newCache = new FsLruCache({ dir, shards: 2 });
-      expect(await newCache.pttl("key")).toBeGreaterThan(3000);
+      expect(await newCache.ttl("key")).toBeGreaterThanOrEqual(3);
       await newCache.close();
     });
 
     it("should sync persist() to both tiers", async () => {
       const testCache = createTestCache("persist-both", { maxMemoryItems: 10, shards: 2 });
 
-      await testCache.set("key", "value", 5000);
-      expect(await testCache.pttl("key")).toBeGreaterThan(0);
+      await testCache.set("key", "value", 5);
+      expect(await testCache.ttl("key")).toBeGreaterThan(0);
 
       await testCache.persist("key");
-      expect(await testCache.pttl("key")).toBe(-1);
+      expect(await testCache.ttl("key")).toBe(-1);
 
       await testCache.close();
       const dir = testDir("persist-both");
       const newCache = new FsLruCache({ dir, shards: 2 });
-      expect(await newCache.pttl("key")).toBe(-1);
+      expect(await newCache.ttl("key")).toBe(-1);
       expect(await newCache.get("key")).toBe("value");
       await newCache.close();
     });
@@ -363,11 +342,11 @@ describe("FsLruCache", () => {
     it("should preserve TTL when promoting from disk to memory", async () => {
       const smallCache = createTestCache("ttl-promote", { maxMemoryItems: 1, shards: 2 });
 
-      await smallCache.set("with-ttl", "value", 5000);
+      await smallCache.set("with-ttl", "value", 5);
       await smallCache.set("other", "other-value"); // Evicts 'with-ttl'
 
       expect(await smallCache.get("with-ttl")).toBe("value");
-      expect(await smallCache.pttl("with-ttl")).toBeGreaterThan(4000);
+      expect(await smallCache.ttl("with-ttl")).toBeGreaterThanOrEqual(4);
 
       await smallCache.close();
     });
@@ -549,8 +528,8 @@ describe("FsLruCache", () => {
 
     it("should support TTL for individual entries", async () => {
       await cache.mset([
-        ["short", "value", 50],
-        ["long", "value", 5000],
+        ["short", "value", 0.05], // 50ms
+        ["long", "value", 5],
       ]);
 
       expect(await cache.get("short")).toBe("value");
@@ -653,54 +632,13 @@ describe("FsLruCache", () => {
     });
   });
 
-  describe("setnx", () => {
-    it("should set value if key does not exist", async () => {
-      expect(await cache.setnx("key", "value")).toBe(true);
-      expect(await cache.get("key")).toBe("value");
-    });
-
-    it("should not set value if key exists", async () => {
-      await cache.set("key", "original");
-      expect(await cache.setnx("key", "new")).toBe(false);
-      expect(await cache.get("key")).toBe("original");
-    });
-
-    it("should support TTL", async () => {
-      await cache.setnx("key", "value", 1000);
-      const ttl = await cache.pttl("key");
-      expect(ttl).toBeGreaterThan(900);
-      expect(ttl).toBeLessThanOrEqual(1000);
-    });
-
-    it("should work after key expires", async () => {
-      await cache.set("key", "old", 50);
-      await delay(60);
-
-      expect(await cache.setnx("key", "new")).toBe(true);
-      expect(await cache.get("key")).toBe("new");
-    });
-
-    it("should only allow one concurrent caller to succeed", async () => {
-      const results = await Promise.all([
-        cache.setnx("race-key", "value-1"),
-        cache.setnx("race-key", "value-2"),
-        cache.setnx("race-key", "value-3"),
-        cache.setnx("race-key", "value-4"),
-        cache.setnx("race-key", "value-5"),
-      ]);
-
-      expect(results.filter((r) => r === true).length).toBe(1);
-      expect(await cache.exists("race-key")).toBe(true);
-    });
-  });
-
   describe("persist", () => {
     it("should remove TTL from key", async () => {
-      await cache.set("key", "value", 5000);
-      expect(await cache.pttl("key")).toBeGreaterThan(0);
+      await cache.set("key", "value", 5);
+      expect(await cache.ttl("key")).toBeGreaterThan(0);
 
       expect(await cache.persist("key")).toBe(true);
-      expect(await cache.pttl("key")).toBe(-1);
+      expect(await cache.ttl("key")).toBe(-1);
     });
 
     it("should return true for key without TTL", async () => {
@@ -713,7 +651,7 @@ describe("FsLruCache", () => {
     });
 
     it("should keep value after persist", async () => {
-      await cache.set("key", { data: "test" }, 5000);
+      await cache.set("key", { data: "test" }, 5);
       await cache.persist("key");
       expect(await cache.get("key")).toEqual({ data: "test" });
     });
@@ -729,23 +667,23 @@ describe("FsLruCache", () => {
       expect(await cache.touch("nonexistent")).toBe(false);
     });
 
-    it("should not change TTL (use pexpire for TTL updates)", async () => {
-      await cache.set("key", "value", 5000);
+    it("should not change TTL (use expire for TTL updates)", async () => {
+      await cache.set("key", "value", 5);
       await delay(100);
       await cache.touch("key");
-      const ttl = await cache.pttl("key");
+      const ttl = await cache.ttl("key");
       // TTL should be unchanged (minus elapsed time)
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThan(5000);
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
     });
 
     it("should preserve TTL when not provided", async () => {
-      await cache.set("key", "value", 5000);
+      await cache.set("key", "value", 5);
       await delay(100);
       await cache.touch("key");
-      const ttl = await cache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThan(5000);
+      const ttl = await cache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
     });
 
     it("should preserve value", async () => {
@@ -755,7 +693,7 @@ describe("FsLruCache", () => {
     });
 
     it("should return false for expired keys", async () => {
-      await cache.set("key", "value", 50);
+      await cache.set("key", "value", 0.05); // 50ms
       await delay(60);
       expect(await cache.touch("key")).toBe(false);
     });
@@ -782,25 +720,25 @@ describe("FsLruCache", () => {
     it("should work on keys only in disk", async () => {
       const smallCache = createTestCache("touch-disk", { maxMemoryItems: 1, shards: 2 });
 
-      await smallCache.set("disk-only", "value", 5000);
+      await smallCache.set("disk-only", "value", 5);
       await smallCache.set("in-memory", "value2"); // Evicts disk-only from memory
 
       expect(await smallCache.touch("disk-only")).toBe(true);
       // TTL should be preserved
-      expect(await smallCache.pttl("disk-only")).toBeGreaterThan(4000);
+      expect(await smallCache.ttl("disk-only")).toBeGreaterThanOrEqual(4);
 
       await smallCache.close();
     });
 
     it("should persist LRU update to disk via mtime", async () => {
-      await cache.set("key", "value", 10000);
+      await cache.set("key", "value", 10);
       await cache.touch("key");
       await cache.close();
 
       const dir = testDir("integration");
       const newCache = new FsLruCache({ dir, shards: 4 });
       // TTL should be preserved (touch doesn't change TTL)
-      expect(await newCache.pttl("key")).toBeGreaterThan(9000);
+      expect(await newCache.ttl("key")).toBeGreaterThanOrEqual(9);
       await newCache.close();
 
       cache = createTestCache("integration");
@@ -834,8 +772,8 @@ describe("FsLruCache", () => {
     });
 
     it("should not count expired items", async () => {
-      await cache.set("short", "value", 50);
-      await cache.set("long", "value", 5000);
+      await cache.set("short", "value", 0.05); // 50ms
+      await cache.set("long", "value", 5);
       expect(await cache.size()).toBe(2);
 
       await delay(60);
@@ -864,9 +802,9 @@ describe("FsLruCache", () => {
 
   describe("prune", () => {
     it("should remove expired entries", async () => {
-      await cache.set("expired1", "value", 50);
-      await cache.set("expired2", "value", 50);
-      await cache.set("valid", "value", 5000);
+      await cache.set("expired1", "value", 0.05); // 50ms
+      await cache.set("expired2", "value", 0.05); // 50ms
+      await cache.set("valid", "value", 5);
 
       expect(await cache.size()).toBe(3);
       await delay(60);
@@ -879,7 +817,7 @@ describe("FsLruCache", () => {
 
     it("should return 0 when no expired entries", async () => {
       await cache.set("a", 1);
-      await cache.set("b", 2, 5000);
+      await cache.set("b", 2, 5);
 
       const pruned = await cache.prune();
       expect(pruned).toBe(0);
@@ -892,7 +830,7 @@ describe("FsLruCache", () => {
 
     it("should prune both memory and disk", async () => {
       // Set items that fit in memory
-      await cache.set("mem", "small", 50);
+      await cache.set("mem", "small", 0.05); // 50ms
       await delay(60);
 
       const pruned = await cache.prune();
@@ -902,8 +840,8 @@ describe("FsLruCache", () => {
     it("should work with pruneInterval for automatic cleanup", async () => {
       const autoCache = createTestCache("prune-interval", { pruneInterval: 100 });
 
-      await autoCache.set("short", "value", 50);
-      await autoCache.set("long", "value", 5000);
+      await autoCache.set("short", "value", 0.05); // 50ms
+      await autoCache.set("long", "value", 5);
 
       expect(await autoCache.size()).toBe(2);
 
@@ -934,7 +872,7 @@ describe("FsLruCache", () => {
 
     it("should work with namespace", async () => {
       const nsCache = createTestCache("prune-namespace", { namespace: "app" });
-      await nsCache.set("key", "value", 50);
+      await nsCache.set("key", "value", 0.05); // 50ms
       await delay(60);
 
       const pruned = await nsCache.prune();
@@ -955,9 +893,8 @@ describe("FsLruCache", () => {
       { method: "stats", fn: (c: FsLruCache) => c.stats() },
       { method: "clear", fn: (c: FsLruCache) => c.clear() },
       { method: "getOrSet", fn: (c: FsLruCache) => c.getOrSet("key", () => "value") },
-      { method: "setnx", fn: (c: FsLruCache) => c.setnx("key", "value") },
-      { method: "pexpire", fn: (c: FsLruCache) => c.pexpire("key", 1000) },
-      { method: "pttl", fn: (c: FsLruCache) => c.pttl("key") },
+      { method: "expire", fn: (c: FsLruCache) => c.expire("key", 10) },
+      { method: "ttl", fn: (c: FsLruCache) => c.ttl("key") },
       { method: "persist", fn: (c: FsLruCache) => c.persist("key") },
       { method: "touch", fn: (c: FsLruCache) => c.touch("key") },
       { method: "size", fn: (c: FsLruCache) => c.size() },
@@ -1015,8 +952,8 @@ describe("FsLruCache", () => {
     });
 
     it("should support TTL", async () => {
-      await cache.getOrSet("key", () => "value", 1000);
-      expect(await cache.pttl("key")).toBeGreaterThan(900);
+      await cache.getOrSet("key", () => "value", 5);
+      expect(await cache.ttl("key")).toBeGreaterThanOrEqual(4);
     });
 
     it("should work with complex objects", async () => {
@@ -1037,7 +974,7 @@ describe("FsLruCache", () => {
     it("should call fn again after key expires", async () => {
       let callCount = 0;
 
-      await cache.getOrSet("key", () => `value-${++callCount}`, 50);
+      await cache.getOrSet("key", () => `value-${++callCount}`, 0.05); // 50ms
       expect(callCount).toBe(1);
 
       await delay(60);
@@ -1095,7 +1032,7 @@ describe("FsLruCache", () => {
 
   describe("expired key behavior", () => {
     it("exists() should return false for expired keys", async () => {
-      await cache.set("key", "value", 50);
+      await cache.set("key", "value", 0.05); // 50ms
       expect(await cache.exists("key")).toBe(true);
 
       await delay(60);
@@ -1103,7 +1040,7 @@ describe("FsLruCache", () => {
     });
 
     it("del() should clean up expired keys from disk", async () => {
-      await cache.set("key", "value", 50);
+      await cache.set("key", "value", 0.05); // 50ms
       await delay(60);
 
       expect(await cache.del("key")).toBe(true);
@@ -1111,8 +1048,8 @@ describe("FsLruCache", () => {
     });
 
     it("keys() should not return expired keys", async () => {
-      await cache.set("short", "value", 50);
-      await cache.set("long", "value", 5000);
+      await cache.set("short", "value", 0.05); // 50ms
+      await cache.set("long", "value", 5);
 
       expect((await cache.keys()).sort()).toEqual(["long", "short"]);
 
@@ -1121,15 +1058,15 @@ describe("FsLruCache", () => {
     });
 
     it("persist() should return false for expired keys", async () => {
-      await cache.set("key", "value", 50);
+      await cache.set("key", "value", 0.05); // 50ms
       await delay(60);
       expect(await cache.persist("key")).toBe(false);
     });
 
-    it("pexpire() should return false for expired keys", async () => {
-      await cache.set("key", "value", 50);
+    it("expire() should return false for expired keys", async () => {
+      await cache.set("key", "value", 0.05); // 50ms
       await delay(60);
-      expect(await cache.pexpire("key", 5000)).toBe(false);
+      expect(await cache.expire("key", 5)).toBe(false);
     });
   });
 
@@ -1187,20 +1124,19 @@ describe("FsLruCache", () => {
       const ttlCache = createTestCache("default-ttl", { defaultTtl: 5 });
       await ttlCache.set("key", "value");
 
-      const ttl = await ttlCache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      const ttl = await ttlCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
 
       await ttlCache.close();
     });
 
     it("should allow overriding defaultTtl with explicit TTL", async () => {
       const ttlCache = createTestCache("default-ttl-override", { defaultTtl: 5 });
-      await ttlCache.set("key", "value", 1000);
+      await ttlCache.set("key", "value", 1);
 
-      const ttl = await ttlCache.pttl("key");
-      expect(ttl).toBeGreaterThan(900);
-      expect(ttl).toBeLessThanOrEqual(1000);
+      const ttl = await ttlCache.ttl("key");
+      expect(ttl).toBeLessThanOrEqual(1);
 
       await ttlCache.close();
     });
@@ -1209,18 +1145,7 @@ describe("FsLruCache", () => {
       const ttlCache = createTestCache("default-ttl-disable", { defaultTtl: 5 });
       await ttlCache.set("key", "value", 0);
 
-      expect(await ttlCache.pttl("key")).toBe(-1);
-
-      await ttlCache.close();
-    });
-
-    it("should apply defaultTtl to setnx", async () => {
-      const ttlCache = createTestCache("default-ttl-setnx", { defaultTtl: 5 });
-      await ttlCache.setnx("key", "value");
-
-      const ttl = await ttlCache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      expect(await ttlCache.ttl("key")).toBe(-1);
 
       await ttlCache.close();
     });
@@ -1229,9 +1154,9 @@ describe("FsLruCache", () => {
       const ttlCache = createTestCache("default-ttl-getorset", { defaultTtl: 5 });
       await ttlCache.getOrSet("key", () => "value");
 
-      const ttl = await ttlCache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      const ttl = await ttlCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
 
       await ttlCache.close();
     });
@@ -1243,14 +1168,14 @@ describe("FsLruCache", () => {
         ["b", 2],
       ]);
 
-      expect(await ttlCache.pttl("a")).toBeGreaterThan(4000);
-      expect(await ttlCache.pttl("b")).toBeGreaterThan(4000);
+      expect(await ttlCache.ttl("a")).toBeGreaterThanOrEqual(4);
+      expect(await ttlCache.ttl("b")).toBeGreaterThanOrEqual(4);
 
       await ttlCache.close();
     });
 
     it("should expire items with defaultTtl", async () => {
-      const ttlCache = createTestCache("default-ttl-expire", { defaultTtl: 0.05 });
+      const ttlCache = createTestCache("default-ttl-expire", { defaultTtl: 0.05 }); // 50ms
       await ttlCache.set("key", "value");
 
       expect(await ttlCache.get("key")).toBe("value");
@@ -1338,22 +1263,22 @@ describe("FsLruCache", () => {
       const nsCache = createTestCache("namespace-ttl", { namespace: "app" });
       await nsCache.set("key", "value");
 
-      await nsCache.pexpire("key", 5000);
-      expect(await nsCache.pttl("key")).toBeGreaterThan(4000);
+      await nsCache.expire("key", 5);
+      expect(await nsCache.ttl("key")).toBeGreaterThanOrEqual(4);
 
       await nsCache.persist("key");
-      expect(await nsCache.pttl("key")).toBe(-1);
+      expect(await nsCache.ttl("key")).toBe(-1);
 
       await nsCache.close();
     });
 
     it("should work with touch", async () => {
       const nsCache = createTestCache("namespace-touch", { namespace: "app" });
-      await nsCache.set("key", "value", 5000);
+      await nsCache.set("key", "value", 5);
 
       expect(await nsCache.touch("key")).toBe(true);
       // TTL should be preserved
-      expect(await nsCache.pttl("key")).toBeGreaterThan(4000);
+      expect(await nsCache.ttl("key")).toBeGreaterThanOrEqual(4);
 
       await nsCache.close();
     });
@@ -1381,16 +1306,6 @@ describe("FsLruCache", () => {
       await nsCache.close();
     });
 
-    it("should work with setnx", async () => {
-      const nsCache = createTestCache("namespace-setnx", { namespace: "app" });
-
-      expect(await nsCache.setnx("key", "value1")).toBe(true);
-      expect(await nsCache.setnx("key", "value2")).toBe(false);
-      expect(await nsCache.get("key")).toBe("value1");
-
-      await nsCache.close();
-    });
-
     it("should combine with defaultTtl", async () => {
       const combinedCache = createTestCache("namespace-defaultttl", {
         namespace: "app",
@@ -1399,7 +1314,7 @@ describe("FsLruCache", () => {
 
       await combinedCache.set("key", "value");
       expect(await combinedCache.get("key")).toBe("value");
-      expect(await combinedCache.pttl("key")).toBeGreaterThan(4000);
+      expect(await combinedCache.ttl("key")).toBeGreaterThanOrEqual(4);
 
       await combinedCache.close();
     });
@@ -1480,28 +1395,28 @@ describe("FsLruCache", () => {
 
     it("should work with TTL operations", async () => {
       const compressedCache = createTestCache("compression-ttl", { gzip: true });
-      await compressedCache.set("key", "value", 5000);
+      await compressedCache.set("key", "value", 5);
 
-      const ttl = await compressedCache.pttl("key");
-      expect(ttl).toBeGreaterThan(4000);
-      expect(ttl).toBeLessThanOrEqual(5000);
+      const ttl = await compressedCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
 
-      await compressedCache.pexpire("key", 10000);
-      expect(await compressedCache.pttl("key")).toBeGreaterThan(9000);
+      await compressedCache.expire("key", 10);
+      expect(await compressedCache.ttl("key")).toBeGreaterThanOrEqual(9);
 
       await compressedCache.persist("key");
-      expect(await compressedCache.pttl("key")).toBe(-1);
+      expect(await compressedCache.ttl("key")).toBe(-1);
 
       await compressedCache.close();
     });
 
     it("should work with touch", async () => {
       const compressedCache = createTestCache("compression-touch", { gzip: true });
-      await compressedCache.set("key", "value", 5000);
+      await compressedCache.set("key", "value", 5);
 
       expect(await compressedCache.touch("key")).toBe(true);
       // TTL should be preserved
-      expect(await compressedCache.pttl("key")).toBeGreaterThan(4000);
+      expect(await compressedCache.ttl("key")).toBeGreaterThanOrEqual(4);
       expect(await compressedCache.get("key")).toBe("value");
 
       await compressedCache.close();
@@ -1558,7 +1473,7 @@ describe("FsLruCache", () => {
 
       await cache.set("key", "value");
       expect(await cache.get("key")).toBe("value");
-      expect(await cache.pttl("key")).toBeGreaterThan(4000);
+      expect(await cache.ttl("key")).toBeGreaterThanOrEqual(4);
 
       const keys = await cache.keys();
       expect(keys).toEqual(["key"]);
@@ -1576,7 +1491,7 @@ describe("FsLruCache", () => {
         shards: 2,
       });
 
-      await smallCache.set("expiring", "x".repeat(100), 50);
+      await smallCache.set("expiring", "x".repeat(100), 0.05); // 50ms
       await smallCache.set("permanent1", "x".repeat(100));
       await smallCache.set("permanent2", "x".repeat(100));
 
@@ -1692,7 +1607,7 @@ describe("FsLruCache", () => {
       expect(stats.disk.items).toBe(2);
 
       // Touch should work on disk-only keys
-      expect(await smallCache.touch("a", 5000)).toBe(true);
+      expect(await smallCache.touch("a")).toBe(true);
 
       // Touch should return false for non-existent keys
       expect(await smallCache.touch("nonexistent")).toBe(false);
@@ -1700,8 +1615,8 @@ describe("FsLruCache", () => {
       await smallCache.close();
     });
 
-    it("should be consistent after pexpire on disk-only key", async () => {
-      const smallCache = createTestCache("sync-pexpire-diskonly", {
+    it("should be consistent after expire on disk-only key", async () => {
+      const smallCache = createTestCache("sync-expire-diskonly", {
         maxMemoryItems: 1,
         shards: 2,
       });
@@ -1709,9 +1624,9 @@ describe("FsLruCache", () => {
       await smallCache.set("a", "value-a");
       await smallCache.set("b", "value-b"); // Evicts 'a' from memory
 
-      // pexpire on disk-only key should work
-      expect(await smallCache.pexpire("a", 5000)).toBe(true);
-      expect(await smallCache.pttl("a")).toBeGreaterThan(4000);
+      // expire on disk-only key should work
+      expect(await smallCache.expire("a", 5)).toBe(true);
+      expect(await smallCache.ttl("a")).toBeGreaterThanOrEqual(4);
 
       // Value should still be retrievable
       expect(await smallCache.get("a")).toBe("value-a");
@@ -1725,15 +1640,15 @@ describe("FsLruCache", () => {
         shards: 2,
       });
 
-      await smallCache.set("a", "value-a", 5000);
+      await smallCache.set("a", "value-a", 5);
       await smallCache.set("b", "value-b"); // Evicts 'a' from memory
 
       // 'a' is on disk only with TTL
-      expect(await smallCache.pttl("a")).toBeGreaterThan(4000);
+      expect(await smallCache.ttl("a")).toBeGreaterThanOrEqual(4);
 
       // persist on disk-only key should work
       expect(await smallCache.persist("a")).toBe(true);
-      expect(await smallCache.pttl("a")).toBe(-1);
+      expect(await smallCache.ttl("a")).toBe(-1);
 
       // Value should still be retrievable
       expect(await smallCache.get("a")).toBe("value-a");
@@ -1744,7 +1659,7 @@ describe("FsLruCache", () => {
     it("should return false for TTL operations on non-existent keys", async () => {
       const testCache = createTestCache("sync-ttl-nonexistent");
 
-      expect(await testCache.pexpire("ghost", 5000)).toBe(false);
+      expect(await testCache.expire("ghost", 5)).toBe(false);
       expect(await testCache.persist("ghost")).toBe(false);
       expect(await testCache.touch("ghost")).toBe(false);
 
