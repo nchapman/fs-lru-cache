@@ -496,10 +496,7 @@ async function benchmarkRedisComparison() {
   await cleanupRedis();
   let redisSetIdx = 0;
   const redisSet = await runBench("redis SET - small (100B)", 5000, async () => {
-    await redis!.set(
-      `${REDIS_PREFIX}small:${redisSetIdx++}`,
-      JSON.stringify(smallValue),
-    );
+    await redis!.set(`${REDIS_PREFIX}small:${redisSetIdx++}`, JSON.stringify(smallValue));
   });
   console.log(formatResult(redisSet));
 
@@ -513,10 +510,7 @@ async function benchmarkRedisComparison() {
   // --- Redis: SET medium ---
   let redisMedIdx = 0;
   const redisMedSet = await runBench("redis SET - medium (1KB)", 5000, async () => {
-    await redis!.set(
-      `${REDIS_PREFIX}med:${redisMedIdx++}`,
-      JSON.stringify(mediumValue),
-    );
+    await redis!.set(`${REDIS_PREFIX}med:${redisMedIdx++}`, JSON.stringify(mediumValue));
   });
   console.log(formatResult(redisMedSet));
 

@@ -82,14 +82,15 @@ new FsLruCache({
 
 Benchmarks on Apple M4 Max, Node.js v22. These numbers are rough estimates—your mileage will vary based on hardware, value sizes, and access patterns. The point isn't to compete with Redis (which is a full-featured networked data store), but to show that fs-lru-cache is fast enough for most caching needs without requiring a separate service.
 
-| Operation | fs-lru-cache | Redis (localhost) |
-|-----------|-------------|-------------------|
-| get (memory hit) | ~1,500,000 ops/s | ~40,000 ops/s |
-| set (100B) | ~75,000 ops/s | ~23,000 ops/s |
-| set (1KB) | ~53,000 ops/s | ~28,000 ops/s |
-| mixed 80/20 r/w | ~1,500,000 ops/s | ~38,000 ops/s |
+| Operation        | fs-lru-cache     | Redis (localhost) |
+| ---------------- | ---------------- | ----------------- |
+| get (memory hit) | ~1,500,000 ops/s | ~40,000 ops/s     |
+| set (100B)       | ~75,000 ops/s    | ~23,000 ops/s     |
+| set (1KB)        | ~53,000 ops/s    | ~28,000 ops/s     |
+| mixed 80/20 r/w  | ~1,500,000 ops/s | ~38,000 ops/s     |
 
 Key tradeoffs vs Redis:
+
 - **Faster for hot data**: No network overhead for memory hits
 - **No server required**: Just a library, no ops burden
 - **Single-node only**: Not distributed, no pub/sub

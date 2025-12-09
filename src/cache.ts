@@ -1,4 +1,4 @@
-import { CacheOptions, CacheEntry, CacheStats, PendingWrite, DEFAULT_OPTIONS } from "./types.js";
+import { CacheOptions, CacheStats, PendingWrite, DEFAULT_OPTIONS } from "./types.js";
 import { MemoryStore } from "./memory-store.js";
 import { FileStore } from "./file-store.js";
 import { isExpired, compilePattern, matchPattern, CompiledPattern } from "./utils.js";
