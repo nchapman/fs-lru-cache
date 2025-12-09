@@ -1,6 +1,7 @@
-import { CacheOptions, CacheEntry, CacheStats, DEFAULT_OPTIONS } from "./types.js";
+import { CacheOptions, CacheStats, PendingWrite, DEFAULT_OPTIONS } from "./types.js";
 import { MemoryStore } from "./memory-store.js";
 import { FileStore } from "./file-store.js";
+import { isExpired, compilePattern, matchPattern, CompiledPattern } from "./utils.js";
 
 /**
  * FsLruCache - An LRU cache with file system persistence.
@@ -8,7 +9,7 @@ import { FileStore } from "./file-store.js";
  * Features:
  * - Two-tier storage: hot items in memory, all items on disk
  * - Memory-first reads for fast access to frequently used data
- * - Write-through to disk for durability
+ * - Async writes by default (memory updated immediately, disk in background)
  * - LRU eviction in both memory and disk stores
  * - TTL support with lazy expiration
  * - Stampede protection for concurrent operations
@@ -19,6 +20,7 @@ export class FsLruCache {
   private readonly maxMemorySize: number;
   private readonly defaultTtl?: number;
   private readonly namespace?: string;
+  private readonly syncWrites: boolean;
   private hits = 0;
   private misses = 0;
   private closed = false;
@@ -26,11 +28,20 @@ export class FsLruCache {
   // In-flight operations for stampede protection
   private inFlight = new Map<string, Promise<unknown>>();
 
+  /**
+   * Pending async disk writes per key.
+   * This is the primary source of truth for "intended state" during async writes.
+   * Contains the serialized value so reads can return it before disk write completes.
+   * Writes are chained: new writes wait for prior writes to the same key.
+   */
+  private pendingWrites = new Map<string, PendingWrite>();
+
   // Background prune interval
   private pruneTimer?: ReturnType<typeof setInterval>;
 
   // Debounced touch timers for file store LRU updates
   private touchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private pendingTouches = new Set<Promise<void>>();
   private readonly touchDebounceMs = 5000;
 
   constructor(options: CacheOptions = {}) {
@@ -38,6 +49,7 @@ export class FsLruCache {
     this.maxMemorySize = opts.maxMemorySize;
     this.defaultTtl = opts.defaultTtl;
     this.namespace = opts.namespace;
+    this.syncWrites = opts.syncWrites;
 
     this.memory = new MemoryStore({
       maxItems: opts.maxMemoryItems,
@@ -114,12 +126,26 @@ export class FsLruCache {
     const timer = setTimeout(() => {
       this.touchTimers.delete(key);
       if (!this.closed) {
-        this.files.touch(key).catch(() => {});
+        this.executeTouch(key);
       }
     }, this.touchDebounceMs);
 
     timer.unref();
     this.touchTimers.set(key, timer);
+  }
+
+  /**
+   * Execute a touch and track the promise for flush().
+   */
+  private executeTouch(key: string): void {
+    const touchPromise: Promise<void> = this.files
+      .touch(key)
+      .then(() => {})
+      .catch(() => {})
+      .finally(() => {
+        this.pendingTouches.delete(touchPromise);
+      });
+    this.pendingTouches.add(touchPromise);
   }
 
   /**
@@ -131,6 +157,33 @@ export class FsLruCache {
       clearTimeout(timer);
       this.touchTimers.delete(key);
     }
+  }
+
+  /**
+   * Get a pending write if it exists and hasn't expired.
+   * Returns null if no pending write or if it's expired.
+   */
+  private getValidPendingWrite(key: string): PendingWrite | null {
+    const pending = this.pendingWrites.get(key);
+    if (!pending) return null;
+    if (isExpired(pending.expiresAt)) {
+      // Don't delete here - let the write complete and clean up naturally
+      return null;
+    }
+    return pending;
+  }
+
+  /**
+   * Get all pending write keys matching a pattern.
+   */
+  private getPendingWriteKeys(compiled: CompiledPattern): string[] {
+    const keys: string[] = [];
+    for (const [key, pending] of this.pendingWrites) {
+      if (!isExpired(pending.expiresAt) && matchPattern(key, compiled)) {
+        keys.push(key);
+      }
+    }
+    return keys;
   }
 
   /**
@@ -155,13 +208,23 @@ export class FsLruCache {
 
   /**
    * Get a value from the cache.
-   * Checks memory first, then disk (promoting to memory on hit).
+   * Checks pending writes first, then memory, then disk.
+   * This ensures read-after-write consistency even with async writes.
    */
   async get<T = unknown>(key: string): Promise<T | null> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
-    // Check memory first (returns JSON string)
+    // Check pending writes first (most recent intended state)
+    const pending = this.getValidPendingWrite(prefixedKey);
+    if (pending) {
+      this.hits++;
+      // Schedule debounced touch since this key will be on disk soon
+      this.debouncedFileTouch(prefixedKey);
+      return JSON.parse(pending.serialized) as T;
+    }
+
+    // Check memory (returns JSON string)
     const memSerialized = this.memory.get(prefixedKey);
     if (memSerialized !== null) {
       this.hits++;
@@ -215,12 +278,44 @@ export class FsLruCache {
     // Build disk entry JSON using already-serialized value (avoids double serialization)
     const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
 
-    // Write to disk first (ensures durability before memory)
-    await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
-
-    // Write to memory if it fits
+    // Write to memory if it fits (fast path for subsequent reads)
     if (valueSize <= this.maxMemorySize) {
       this.memory.set(prefixedKey, valueSerialized, expiresAt);
+    }
+
+    // Write to disk (async by default, sync if configured)
+    if (this.syncWrites) {
+      await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
+    } else {
+      // Chain this write after any existing pending write for the same key.
+      // This ensures sequential writes complete in order (no race conditions).
+      const existingPending = this.pendingWrites.get(prefixedKey);
+      const priorPromise = existingPending?.promise ?? Promise.resolve();
+
+      // Create the chained disk write
+      const diskWrite = priorPromise.then(() =>
+        this.files.set(prefixedKey, value, expiresAt, entrySerialized),
+      );
+
+      // Create pending write entry with value metadata for immediate reads
+      const pendingWrite: PendingWrite = {
+        serialized: valueSerialized,
+        expiresAt,
+        size: valueSize,
+        promise: diskWrite
+          .catch(() => {
+            // Evict from memory if disk write fails
+            this.memory.delete(prefixedKey);
+          })
+          .then(() => {
+            // Only delete if this is still the current pending write for this key
+            if (this.pendingWrites.get(prefixedKey) === pendingWrite) {
+              this.pendingWrites.delete(prefixedKey);
+            }
+          }),
+      };
+
+      this.pendingWrites.set(prefixedKey, pendingWrite);
     }
   }
 
@@ -231,22 +326,48 @@ export class FsLruCache {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
     this.cancelDebouncedTouch(prefixedKey);
+
+    // Check if key exists in pending writes (for return value)
+    const pending = this.pendingWrites.get(prefixedKey);
+    const hadPending = pending !== undefined && !isExpired(pending.expiresAt);
+
+    // Cancel the pending write intent immediately.
+    // This ensures get() returns null right away, even if disk write is in-flight.
+    // The disk write will complete harmlessly (cleanup is identity-checked).
+    this.pendingWrites.delete(prefixedKey);
+
+    // Remove from memory immediately
     const memDeleted = this.memory.delete(prefixedKey);
+
+    // Wait for any in-flight disk write to complete before deleting.
+    // This ensures the file exists on disk before we try to delete it.
+    if (pending) {
+      await pending.promise;
+    }
+
     const diskDeleted = await this.files.delete(prefixedKey);
-    return memDeleted || diskDeleted;
+    return hadPending || memDeleted || diskDeleted;
   }
 
   /**
    * Check if a key exists in the cache.
+   * Checks pending writes first for consistency with async writes.
    */
   async exists(key: string): Promise<boolean> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
+
+    // Check pending writes first (most recent intended state)
+    if (this.getValidPendingWrite(prefixedKey)) {
+      return true;
+    }
+
     return this.memory.has(prefixedKey) || (await this.files.has(prefixedKey));
   }
 
   /**
    * Get all keys matching a pattern.
+   * Includes keys with pending writes for consistency.
    * @param pattern Glob-like pattern (supports * wildcard)
    */
   async keys(pattern = "*"): Promise<string[]> {
@@ -254,14 +375,17 @@ export class FsLruCache {
 
     // Prefix the pattern for internal lookup
     const prefixedPattern = this.prefixKey(pattern);
+    const compiled = compilePattern(prefixedPattern);
 
+    // Get keys from all sources: pending writes, memory, disk
+    const pendingKeys = this.getPendingWriteKeys(compiled);
     const [memKeys, diskKeys] = await Promise.all([
       Promise.resolve(this.memory.keys(prefixedPattern)),
       this.files.keys(prefixedPattern),
     ]);
 
-    // Remove prefix from returned keys
-    const allKeys = [...new Set([...memKeys, ...diskKeys])];
+    // Remove prefix from returned keys (deduplicated)
+    const allKeys = [...new Set([...pendingKeys, ...memKeys, ...diskKeys])];
     return allKeys.map((k) => this.unprefixKey(k));
   }
 
@@ -272,6 +396,13 @@ export class FsLruCache {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
     const expiresAt = Date.now() + seconds * 1000;
+
+    // If there's a pending write, wait for it to complete first.
+    // We can't modify expiry until the key exists on disk.
+    const pending = this.pendingWrites.get(prefixedKey);
+    if (pending) {
+      await pending.promise;
+    }
 
     // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.setExpiry(prefixedKey, expiresAt);
@@ -291,6 +422,13 @@ export class FsLruCache {
   async persist(key: string): Promise<boolean> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
+
+    // If there's a pending write, wait for it to complete first.
+    // We can't modify expiry until the key exists on disk.
+    const pending = this.pendingWrites.get(prefixedKey);
+    if (pending) {
+      await pending.promise;
+    }
 
     // Disk first - if this fails, don't update memory (keeps them consistent)
     const diskSuccess = await this.files.setExpiry(prefixedKey, null);
@@ -314,6 +452,15 @@ export class FsLruCache {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
 
+    // Check pending writes first - key exists if there's a valid pending write
+    const pending = this.getValidPendingWrite(prefixedKey);
+    if (pending) {
+      // Schedule debounced touch for when the write completes
+      this.debouncedFileTouch(prefixedKey);
+      this.memory.touch(prefixedKey);
+      return true;
+    }
+
     // Disk first - if this fails, key doesn't exist
     const diskSuccess = await this.files.touch(prefixedKey);
     if (!diskSuccess) {
@@ -328,10 +475,18 @@ export class FsLruCache {
   /**
    * Get TTL in seconds.
    * Returns -1 if no expiry, -2 if key not found.
+   * Checks pending writes first for consistency.
    */
   async ttl(key: string): Promise<number> {
     this.assertOpen();
     const prefixedKey = this.prefixKey(key);
+
+    // Check pending writes first
+    const pending = this.getValidPendingWrite(prefixedKey);
+    if (pending) {
+      if (pending.expiresAt === null) return -1;
+      return Math.max(0, Math.ceil((pending.expiresAt - Date.now()) / 1000));
+    }
 
     const memTtlMs = this.memory.getTtl(prefixedKey);
     if (memTtlMs !== -2) {
@@ -379,15 +534,49 @@ export class FsLruCache {
       return { prefixedKey, value, expiresAt, valueSerialized, valueSize, entrySerialized };
     });
 
-    // Phase 2: Write all to disk in parallel
-    await Promise.all(
-      prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)),
-    );
-
-    // Phase 3: Update memory (fast, synchronous operations)
+    // Phase 2: Update memory (fast, synchronous operations)
     for (const p of prepared) {
       if (p.valueSize <= this.maxMemorySize) {
         this.memory.set(p.prefixedKey, p.valueSerialized, p.expiresAt);
+      }
+    }
+
+    // Phase 3: Write all to disk (async by default, with proper chaining)
+    if (this.syncWrites) {
+      await Promise.all(
+        prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)),
+      );
+    } else {
+      // Track each write individually with proper chaining for same-key writes
+      for (const p of prepared) {
+        // Chain this write after any existing pending write for the same key
+        const existingPending = this.pendingWrites.get(p.prefixedKey);
+        const priorPromise = existingPending?.promise ?? Promise.resolve();
+
+        // Create the chained disk write
+        const diskWrite = priorPromise.then(() =>
+          this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized),
+        );
+
+        // Create pending write entry with value metadata for immediate reads
+        const pendingWrite: PendingWrite = {
+          serialized: p.valueSerialized,
+          expiresAt: p.expiresAt,
+          size: p.valueSize,
+          promise: diskWrite
+            .catch(() => {
+              // Evict only this key from memory if its write fails
+              this.memory.delete(p.prefixedKey);
+            })
+            .then(() => {
+              // Only delete if this is still the current pending write for this key
+              if (this.pendingWrites.get(p.prefixedKey) === pendingWrite) {
+                this.pendingWrites.delete(p.prefixedKey);
+              }
+            }),
+        };
+
+        this.pendingWrites.set(p.prefixedKey, pendingWrite);
       }
     }
   }
@@ -426,11 +615,25 @@ export class FsLruCache {
 
   /**
    * Get the total number of items in the cache.
-   * This is the count of items on disk (source of truth).
+   * Includes items with pending writes that haven't completed yet.
    */
   async size(): Promise<number> {
     this.assertOpen();
-    return this.files.getItemCount();
+
+    // Count unique keys across pending writes and disk
+    // Pending writes may include keys not yet on disk (disk-only large values)
+    const diskKeys = await this.files.keys();
+    const diskKeySet = new Set(diskKeys);
+
+    // Add pending write keys that aren't on disk yet
+    let count = diskKeySet.size;
+    for (const [key, pending] of this.pendingWrites) {
+      if (!isExpired(pending.expiresAt) && !diskKeySet.has(key)) {
+        count++;
+      }
+    }
+
+    return count;
   }
 
   /**
@@ -448,6 +651,8 @@ export class FsLruCache {
 
   /**
    * Get cache statistics.
+   * Note: During async writes, disk stats may lag behind the actual state.
+   * Use flush() first if you need accurate post-write statistics.
    */
   async stats(): Promise<CacheStats> {
     this.assertOpen();
@@ -473,6 +678,7 @@ export class FsLruCache {
         items: diskItemCount,
         size: diskSize,
       },
+      pendingWrites: this.pendingWrites.size,
     };
   }
 
@@ -485,33 +691,66 @@ export class FsLruCache {
   }
 
   /**
+   * Wait for all pending async writes and touches to complete.
+   * Useful when you need to ensure data is persisted before reading stats or shutting down.
+   */
+  async flush(): Promise<void> {
+    // Fire all pending debounced touches immediately
+    for (const [key, timer] of this.touchTimers) {
+      clearTimeout(timer);
+      this.touchTimers.delete(key);
+      this.executeTouch(key);
+    }
+
+    // Wait for all pending writes and touches
+    const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+    await Promise.all([...pendingWritePromises, ...this.pendingTouches]);
+  }
+
+  /**
    * Clear all entries from the cache.
    */
   async clear(): Promise<void> {
     this.assertOpen();
-    // Cancel all pending debounced touches
+
+    // Cancel all pending debounced touches (don't need to execute them since we're clearing)
     for (const timer of this.touchTimers.values()) {
       clearTimeout(timer);
     }
     this.touchTimers.clear();
+
+    // Capture pending write promises before clearing the map.
+    // We need to wait for in-flight disk writes to complete before clearing disk,
+    // otherwise they could re-add data after the clear.
+    const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+
+    // Cancel all pending write intents immediately.
+    // This ensures get() returns null right away for all keys.
+    this.pendingWrites.clear();
+
+    // Clear memory immediately
     this.memory.clear();
+
+    // Wait for in-flight disk writes and touches to complete
+    await Promise.all([...pendingWritePromises, ...this.pendingTouches]);
+
+    // Now clear disk (all in-flight writes have landed)
     await this.files.clear();
   }
 
   /**
    * Close the cache.
+   * Waits for pending writes to complete before closing.
    * After closing, all operations will throw.
    */
   async close(): Promise<void> {
+    // Wait for all pending async writes and touches to complete
+    await this.flush();
+
     if (this.pruneTimer) {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
-    // Clear all pending touch timers
-    for (const timer of this.touchTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.touchTimers.clear();
     this.closed = true;
     this.inFlight.clear();
   }

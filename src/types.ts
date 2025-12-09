@@ -26,6 +26,8 @@ export interface CacheOptions {
   gzip?: boolean;
   /** Interval in milliseconds for automatic pruning of expired items (default: disabled). */
   pruneInterval?: number;
+  /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
+  syncWrites?: boolean;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -67,6 +69,24 @@ export interface CacheStats {
     items: number;
     size: number;
   };
+  /** Number of pending async disk writes */
+  pendingWrites: number;
+}
+
+/**
+ * Tracks a pending async disk write.
+ * This allows reads to return the correct value before disk write completes,
+ * and ensures sequential writes to the same key are properly ordered.
+ */
+export interface PendingWrite {
+  /** JSON-serialized value for immediate reads */
+  serialized: string;
+  /** Expiration timestamp in ms, or null if no expiry */
+  expiresAt: number | null;
+  /** Size of the serialized value in bytes */
+  size: number;
+  /** Promise that resolves when this write (and all prior writes) complete */
+  promise: Promise<void>;
 }
 
 export const DEFAULT_OPTIONS = {
@@ -79,4 +99,5 @@ export const DEFAULT_OPTIONS = {
   namespace: undefined as string | undefined,
   gzip: false,
   pruneInterval: undefined as number | undefined,
+  syncWrites: false,
 };
