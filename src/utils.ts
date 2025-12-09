@@ -9,10 +9,9 @@ export function hashKey(key: string): string {
 }
 
 /**
- * Get the shard index for a key
+ * Get the shard index from a hash
  */
-export function getShardIndex(key: string, shardCount: number): number {
-  const hash = hashKey(key);
+export function getShardIndex(hash: string, shardCount: number): number {
   return parseInt(hash.slice(0, 8), 16) % shardCount;
 }
 
