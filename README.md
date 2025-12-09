@@ -1,6 +1,6 @@
 # fs-lru-cache
 
-LRU cache with file system persistence for Node.js.
+File system LRU cache with in-memory acceleration for Node.js.
 
 ## Install
 
