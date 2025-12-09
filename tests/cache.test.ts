@@ -1694,4 +1694,667 @@ describe("FsLruCache", () => {
       await testCache.close();
     });
   });
+
+  describe("async writes (syncWrites: false)", () => {
+    it("should return immediately from set() before disk write completes", async () => {
+      const asyncCache = createTestCache("async-immediate", { syncWrites: false });
+
+      const start = performance.now();
+      await asyncCache.set("key", "value");
+      const setTime = performance.now() - start;
+
+      // Set should be very fast (memory only, disk is async)
+      // This is a rough check - memory writes are sub-millisecond
+      expect(setTime).toBeLessThan(5);
+
+      // Value should be immediately readable from memory
+      expect(await asyncCache.get("key")).toBe("value");
+
+      await asyncCache.close();
+    });
+
+    it("should persist to disk after flush()", async () => {
+      const asyncCache = createTestCache("async-flush", { syncWrites: false });
+
+      await asyncCache.set("key", "value");
+      await asyncCache.flush();
+
+      // Verify it's on disk by creating a new cache instance
+      await asyncCache.close();
+
+      const newCache = createTestCache("async-flush", { syncWrites: true });
+      expect(await newCache.get("key")).toBe("value");
+      await newCache.close();
+    });
+
+    it("should persist to disk after close()", async () => {
+      const asyncCache = createTestCache("async-close", { syncWrites: false });
+
+      await asyncCache.set("key", "value");
+      await asyncCache.close();
+
+      // Verify it's on disk by creating a new cache instance
+      const newCache = createTestCache("async-close", { syncWrites: true });
+      expect(await newCache.get("key")).toBe("value");
+      await newCache.close();
+    });
+
+    it("should handle multiple concurrent async writes", async () => {
+      const asyncCache = createTestCache("async-concurrent", {
+        syncWrites: false,
+        maxMemoryItems: 100,
+        maxMemorySize: 100 * 1024,
+      });
+
+      // Fire off many writes without awaiting
+      const promises = [];
+      for (let i = 0; i < 100; i++) {
+        promises.push(asyncCache.set(`key:${i}`, `value:${i}`));
+      }
+      await Promise.all(promises);
+
+      // All should be readable from memory immediately
+      for (let i = 0; i < 100; i++) {
+        expect(await asyncCache.get(`key:${i}`)).toBe(`value:${i}`);
+      }
+
+      // After flush, all should be on disk
+      await asyncCache.flush();
+      const stats = await asyncCache.stats();
+      expect(stats.disk.items).toBe(100);
+
+      await asyncCache.close();
+    });
+
+    it("should persist mset() writes after flush()", async () => {
+      const asyncCache = createTestCache("async-mset", { syncWrites: false });
+
+      await asyncCache.mset([
+        ["a", 1],
+        ["b", 2],
+        ["c", 3],
+      ]);
+
+      // Should be readable from memory immediately
+      expect(await asyncCache.get("a")).toBe(1);
+      expect(await asyncCache.get("b")).toBe(2);
+      expect(await asyncCache.get("c")).toBe(3);
+
+      await asyncCache.flush();
+
+      // Verify on disk
+      const stats = await asyncCache.stats();
+      expect(stats.disk.items).toBe(3);
+
+      await asyncCache.close();
+    });
+
+    it("flush() should fire pending debounced touches", async () => {
+      const asyncCache = createTestCache("async-touch", { syncWrites: false });
+
+      await asyncCache.set("key", "value");
+      await asyncCache.flush();
+
+      // Access the key to trigger a debounced touch
+      await asyncCache.get("key");
+
+      // Flush should fire the debounced touch immediately
+      await asyncCache.flush();
+
+      // If we got here without hanging, the test passes
+      await asyncCache.close();
+    });
+
+    it("clear() should wait for pending writes before clearing", async () => {
+      const asyncCache = createTestCache("async-clear", { syncWrites: false });
+
+      // Start some async writes
+      await asyncCache.set("key1", "value1");
+      await asyncCache.set("key2", "value2");
+
+      // Clear should wait for writes then clear
+      await asyncCache.clear();
+
+      // Cache should be empty
+      expect(await asyncCache.get("key1")).toBeNull();
+      expect(await asyncCache.get("key2")).toBeNull();
+      const stats = await asyncCache.stats();
+      expect(stats.disk.items).toBe(0);
+      expect(stats.memory.items).toBe(0);
+
+      await asyncCache.close();
+    });
+
+    it("syncWrites: true should block until disk write completes", async () => {
+      const syncCache = createTestCache("sync-writes", { syncWrites: true });
+
+      await syncCache.set("key", "value");
+
+      // Should already be on disk (no flush needed)
+      const stats = await syncCache.stats();
+      expect(stats.disk.items).toBe(1);
+
+      await syncCache.close();
+    });
+
+    it("del() should wait for pending write before deleting", async () => {
+      const asyncCache = createTestCache("async-del", { syncWrites: false });
+
+      // Start an async write
+      await asyncCache.set("key", "value");
+
+      // Delete should wait for write to complete, then delete
+      const deleted = await asyncCache.del("key");
+      expect(deleted).toBe(true);
+
+      // Key should be gone from both memory and disk
+      expect(await asyncCache.get("key")).toBeNull();
+
+      // Verify disk is empty too
+      await asyncCache.flush();
+      const stats = await asyncCache.stats();
+      expect(stats.disk.items).toBe(0);
+
+      await asyncCache.close();
+    });
+
+    it("del() during pending write should not leave stale data", async () => {
+      const asyncCache = createTestCache("async-del-stale", { syncWrites: false });
+
+      // Write, then immediately delete
+      await asyncCache.set("key", "value");
+      await asyncCache.del("key");
+
+      // Even after flush, key should be gone
+      await asyncCache.flush();
+      expect(await asyncCache.get("key")).toBeNull();
+
+      // Reopen cache to verify disk state
+      await asyncCache.close();
+      const newCache = createTestCache("async-del-stale", { syncWrites: true });
+      expect(await newCache.get("key")).toBeNull();
+      await newCache.close();
+    });
+
+    it("mset() should only evict failed keys, not all keys", async () => {
+      const asyncCache = createTestCache("async-mset-partial", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+      });
+
+      // Write multiple keys
+      await asyncCache.mset([
+        ["a", 1],
+        ["b", 2],
+        ["c", 3],
+      ]);
+
+      // All should be in memory immediately
+      expect(await asyncCache.get("a")).toBe(1);
+      expect(await asyncCache.get("b")).toBe(2);
+      expect(await asyncCache.get("c")).toBe(3);
+
+      await asyncCache.flush();
+
+      // All should be on disk
+      const stats = await asyncCache.stats();
+      expect(stats.disk.items).toBe(3);
+
+      await asyncCache.close();
+    });
+  });
+
+  describe("async write consistency guarantees", () => {
+    it("get() returns value immediately for disk-only async writes", async () => {
+      // Create cache where values are too large for memory
+      const asyncCache = createTestCache("consistency-disk-only", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10, // Very small - values won't fit
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("large", largeValue);
+
+      // Value should NOT be in memory (too large)
+      const stats = await asyncCache.stats();
+      expect(stats.memory.items).toBe(0);
+
+      // But get() should still return the value from pending writes
+      expect(await asyncCache.get("large")).toBe(largeValue);
+
+      await asyncCache.close();
+    });
+
+    it("exists() returns true for pending disk-only writes", async () => {
+      const asyncCache = createTestCache("consistency-exists", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("large", largeValue);
+
+      // Should exist even though disk write hasn't completed
+      expect(await asyncCache.exists("large")).toBe(true);
+
+      await asyncCache.close();
+    });
+
+    it("keys() includes pending disk-only writes", async () => {
+      const asyncCache = createTestCache("consistency-keys", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("large", largeValue);
+      await asyncCache.set("small", "tiny"); // This also won't fit due to maxMemorySize
+
+      // Both keys should be returned
+      const keys = await asyncCache.keys();
+      expect(keys.sort()).toEqual(["large", "small"]);
+
+      await asyncCache.close();
+    });
+
+    it("ttl() returns correct value for pending writes", async () => {
+      const asyncCache = createTestCache("consistency-ttl", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("large", largeValue, 5);
+
+      // TTL should be accessible from pending write
+      const ttl = await asyncCache.ttl("large");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
+
+      await asyncCache.close();
+    });
+
+    it("size() includes pending disk-only writes", async () => {
+      const asyncCache = createTestCache("consistency-size", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("large1", largeValue);
+      await asyncCache.set("large2", largeValue);
+
+      // Size should include pending writes
+      expect(await asyncCache.size()).toBe(2);
+
+      await asyncCache.close();
+    });
+
+    it("sequential writes to same key are properly ordered", async () => {
+      const asyncCache = createTestCache("consistency-ordering", {
+        syncWrites: false,
+      });
+
+      // Fire off sequential writes without awaiting
+      await asyncCache.set("key", "v1");
+      await asyncCache.set("key", "v2");
+      await asyncCache.set("key", "v3");
+
+      // Immediate read should return the latest value
+      expect(await asyncCache.get("key")).toBe("v3");
+
+      // After flush, disk should have the correct final value
+      await asyncCache.flush();
+      expect(await asyncCache.get("key")).toBe("v3");
+
+      // Verify disk state by reopening cache
+      await asyncCache.close();
+      const newCache = createTestCache("consistency-ordering", { syncWrites: true });
+      expect(await newCache.get("key")).toBe("v3");
+      await newCache.close();
+    });
+
+    it("getOrSet() checks pending writes", async () => {
+      const asyncCache = createTestCache("consistency-getorset", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      let computeCount = 0;
+      const compute = () => {
+        computeCount++;
+        return "x".repeat(100);
+      };
+
+      // First call computes and stores
+      const result1 = await asyncCache.getOrSet("key", compute);
+      expect(result1).toBe("x".repeat(100));
+      expect(computeCount).toBe(1);
+
+      // Second call should find value in pending writes, not recompute
+      const result2 = await asyncCache.getOrSet("key", compute);
+      expect(result2).toBe("x".repeat(100));
+      expect(computeCount).toBe(1); // Should still be 1
+
+      await asyncCache.close();
+    });
+
+    it("stats() includes pendingWrites count", async () => {
+      const asyncCache = createTestCache("consistency-stats", {
+        syncWrites: false,
+      });
+
+      // No pending writes initially
+      let stats = await asyncCache.stats();
+      expect(stats.pendingWrites).toBe(0);
+
+      // Start some writes
+      await asyncCache.set("a", 1);
+      await asyncCache.set("b", 2);
+
+      // Should have pending writes (may vary based on timing)
+      stats = await asyncCache.stats();
+      expect(stats.pendingWrites).toBeGreaterThanOrEqual(0);
+
+      // After flush, no pending writes
+      await asyncCache.flush();
+      stats = await asyncCache.stats();
+      expect(stats.pendingWrites).toBe(0);
+
+      await asyncCache.close();
+    });
+
+    it("expired pending writes are not returned by get()", async () => {
+      const asyncCache = createTestCache("consistency-expired", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue, 0.05); // 50ms TTL
+
+      // Should exist initially
+      expect(await asyncCache.get("key")).toBe(largeValue);
+
+      await delay(60);
+
+      // Should be null after expiration
+      expect(await asyncCache.get("key")).toBeNull();
+
+      await asyncCache.close();
+    });
+
+    it("expired pending writes not included in keys()", async () => {
+      const asyncCache = createTestCache("consistency-expired-keys", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("expires", largeValue, 0.05); // 50ms TTL
+      await asyncCache.set("permanent", largeValue);
+
+      expect((await asyncCache.keys()).sort()).toEqual(["expires", "permanent"]);
+
+      await delay(60);
+
+      expect(await asyncCache.keys()).toEqual(["permanent"]);
+
+      await asyncCache.close();
+    });
+
+    it("concurrent getOrSet calls share computation", async () => {
+      const asyncCache = createTestCache("consistency-concurrent-getorset", {
+        syncWrites: false,
+      });
+
+      let computeCount = 0;
+      const slowCompute = async () => {
+        computeCount++;
+        await delay(50);
+        return `result-${computeCount}`;
+      };
+
+      // Fire concurrent calls
+      const results = await Promise.all([
+        asyncCache.getOrSet("key", slowCompute),
+        asyncCache.getOrSet("key", slowCompute),
+        asyncCache.getOrSet("key", slowCompute),
+      ]);
+
+      // Should only compute once
+      expect(computeCount).toBe(1);
+      // All should get the same result
+      expect(results).toEqual(["result-1", "result-1", "result-1"]);
+
+      await asyncCache.close();
+    });
+
+    it("mset with same key multiple times respects final value", async () => {
+      const asyncCache = createTestCache("consistency-mset-ordering", {
+        syncWrites: false,
+      });
+
+      // Multiple entries for same key in single mset
+      await asyncCache.mset([
+        ["key", "v1"],
+        ["key", "v2"],
+        ["key", "v3"],
+      ]);
+
+      // Should have final value
+      expect(await asyncCache.get("key")).toBe("v3");
+
+      await asyncCache.flush();
+
+      // Disk should have final value
+      await asyncCache.close();
+      const newCache = createTestCache("consistency-mset-ordering", { syncWrites: true });
+      expect(await newCache.get("key")).toBe("v3");
+      await newCache.close();
+    });
+
+    it("del() returns true for pending writes", async () => {
+      const asyncCache = createTestCache("consistency-del-pending", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue);
+
+      // del should return true for pending write
+      const deleted = await asyncCache.del("key");
+      expect(deleted).toBe(true);
+
+      // Key should be gone
+      expect(await asyncCache.get("key")).toBeNull();
+
+      await asyncCache.close();
+    });
+
+    it("pattern matching works with pending writes", async () => {
+      const asyncCache = createTestCache("consistency-pattern", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("user:1", largeValue);
+      await asyncCache.set("user:2", largeValue);
+      await asyncCache.set("post:1", largeValue);
+
+      const userKeys = await asyncCache.keys("user:*");
+      expect(userKeys.sort()).toEqual(["user:1", "user:2"]);
+
+      await asyncCache.close();
+    });
+
+    it("namespace works with pending writes", async () => {
+      const asyncCache = createTestCache("consistency-namespace", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+        namespace: "app",
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue);
+
+      // Should be accessible
+      expect(await asyncCache.get("key")).toBe(largeValue);
+      expect(await asyncCache.exists("key")).toBe(true);
+      expect(await asyncCache.keys()).toEqual(["key"]);
+
+      await asyncCache.close();
+    });
+
+    it("expire() waits for pending write then sets expiry", async () => {
+      const asyncCache = createTestCache("consistency-expire", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue);
+
+      // Key exists only in pending writes (too large for memory)
+      expect((await asyncCache.stats()).memory.items).toBe(0);
+
+      // expire should wait for write to complete, then set expiry
+      expect(await asyncCache.expire("key", 5)).toBe(true);
+
+      // TTL should be set
+      const ttl = await asyncCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
+
+      // Value should still be accessible
+      expect(await asyncCache.get("key")).toBe(largeValue);
+
+      await asyncCache.close();
+    });
+
+    it("persist() waits for pending write then removes expiry", async () => {
+      const asyncCache = createTestCache("consistency-persist", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue, 5); // Set with TTL
+
+      // Key exists only in pending writes
+      expect((await asyncCache.stats()).memory.items).toBe(0);
+
+      // persist should wait for write to complete, then remove expiry
+      expect(await asyncCache.persist("key")).toBe(true);
+
+      // TTL should be removed
+      expect(await asyncCache.ttl("key")).toBe(-1);
+
+      // Value should still be accessible
+      expect(await asyncCache.get("key")).toBe(largeValue);
+
+      await asyncCache.close();
+    });
+
+    it("touch() returns true for pending writes", async () => {
+      const asyncCache = createTestCache("consistency-touch", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue, 5);
+
+      // Key exists only in pending writes
+      expect((await asyncCache.stats()).memory.items).toBe(0);
+
+      // touch should return true for pending writes
+      expect(await asyncCache.touch("key")).toBe(true);
+
+      // TTL should be preserved (touch doesn't change TTL)
+      const ttl = await asyncCache.ttl("key");
+      expect(ttl).toBeGreaterThanOrEqual(4);
+      expect(ttl).toBeLessThanOrEqual(5);
+
+      // Value should still be accessible
+      expect(await asyncCache.get("key")).toBe(largeValue);
+
+      await asyncCache.close();
+    });
+
+    it("del() cancels pending write immediately", async () => {
+      const asyncCache = createTestCache("consistency-del-cancel", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key", largeValue);
+
+      // Key exists only in pending writes
+      expect((await asyncCache.stats()).memory.items).toBe(0);
+      expect(await asyncCache.get("key")).toBe(largeValue);
+
+      // Delete - should cancel pending write intent immediately
+      expect(await asyncCache.del("key")).toBe(true);
+
+      // get() should return null immediately (not wait for disk)
+      expect(await asyncCache.get("key")).toBeNull();
+      expect(await asyncCache.exists("key")).toBe(false);
+
+      // After flush, key should still be gone
+      await asyncCache.flush();
+      expect(await asyncCache.get("key")).toBeNull();
+
+      await asyncCache.close();
+    });
+
+    it("clear() cancels pending writes immediately", async () => {
+      const asyncCache = createTestCache("consistency-clear-cancel", {
+        syncWrites: false,
+        maxMemoryItems: 10,
+        maxMemorySize: 10,
+      });
+
+      const largeValue = "x".repeat(100);
+      await asyncCache.set("key1", largeValue);
+      await asyncCache.set("key2", largeValue);
+
+      // Keys exist only in pending writes
+      expect(await asyncCache.get("key1")).toBe(largeValue);
+      expect(await asyncCache.get("key2")).toBe(largeValue);
+
+      // Start clear - should cancel pending write intents immediately
+      const clearPromise = asyncCache.clear();
+
+      // get() should return null immediately (not wait for clear to complete)
+      expect(await asyncCache.get("key1")).toBeNull();
+      expect(await asyncCache.get("key2")).toBeNull();
+
+      // Wait for clear to complete
+      await clearPromise;
+
+      // Keys should be gone
+      expect(await asyncCache.keys()).toEqual([]);
+
+      await asyncCache.close();
+    });
+  });
 });

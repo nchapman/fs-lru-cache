@@ -1,8 +1,12 @@
 import { FsLruCache } from "./src/index.js";
 import { rm } from "fs/promises";
 import { performance } from "perf_hooks";
+import Redis from "ioredis";
 
 const BENCH_DIR = ".bench-cache";
+const REDIS_PREFIX = "fslru-bench:";
+
+let redis: Redis | null = null;
 
 interface BenchResult {
   name: string;
@@ -16,6 +20,32 @@ interface BenchResult {
 
 async function cleanup() {
   await rm(BENCH_DIR, { recursive: true, force: true });
+}
+
+async function cleanupRedis() {
+  if (!redis) return;
+  const keys = await redis.keys(`${REDIS_PREFIX}*`);
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
+}
+
+async function connectRedis(): Promise<boolean> {
+  try {
+    redis = new Redis({
+      host: "127.0.0.1",
+      port: 6379,
+      lazyConnect: true,
+      connectTimeout: 1000,
+      maxRetriesPerRequest: 0,
+    });
+    await redis.connect();
+    await redis.ping();
+    return true;
+  } catch {
+    redis = null;
+    return false;
+  }
 }
 
 async function runBench(
@@ -78,7 +108,7 @@ async function benchmarkCoreOps() {
 
   // Memory hit (hot cache)
   let hitIdx = 0;
-  const memHit = await runBench("get() - memory hit", 10000, async () => {
+  const memHit = await runBench("get() - memory hit", 50000, async () => {
     await cache.get(`key:${hitIdx++ % 1000}`);
   });
   console.log(formatResult(memHit));
@@ -116,19 +146,19 @@ async function benchmarkCoreOps() {
   const setCache = new FsLruCache({ dir: BENCH_DIR });
 
   let setSmallIdx = 0;
-  const setSmall = await runBench("set() - small value (100B)", 1000, async () => {
+  const setSmall = await runBench("set() - small value (100B)", 5000, async () => {
     await setCache.set(`small:${setSmallIdx++}`, smallValue);
   });
   console.log(formatResult(setSmall));
 
   let setMedIdx = 0;
-  const setMedium = await runBench("set() - medium value (1KB)", 1000, async () => {
+  const setMedium = await runBench("set() - medium value (1KB)", 5000, async () => {
     await setCache.set(`medium:${setMedIdx++}`, mediumValue);
   });
   console.log(formatResult(setMedium));
 
   let setLargeIdx = 0;
-  const setLarge = await runBench("set() - large value (10KB)", 500, async () => {
+  const setLarge = await runBench("set() - large value (10KB)", 2000, async () => {
     await setCache.set(`large:${setLargeIdx++}`, largeValue);
   });
   console.log(formatResult(setLarge));
@@ -245,6 +275,7 @@ async function benchmarkCompression() {
   });
   console.log(formatResult(getNoGzip));
 
+  await noGzip.flush();
   const noGzipStats = await noGzip.stats();
   console.log(`  Disk size (no gzip): ${(noGzipStats.disk.size / 1024).toFixed(1)} KB`);
   await noGzip.close();
@@ -265,6 +296,7 @@ async function benchmarkCompression() {
   });
   console.log(formatResult(getGzip));
 
+  await withGzip.flush();
   const gzipStats = await withGzip.stats();
   console.log(`  Disk size (gzip): ${(gzipStats.disk.size / 1024).toFixed(1)} KB`);
   console.log(
@@ -296,6 +328,7 @@ async function benchmarkEviction() {
   );
   console.log(formatResult(setWithEviction));
 
+  await cache.flush();
   const stats = await cache.stats();
   console.log(`  Memory items: ${stats.memory.items}/${stats.memory.maxItems}`);
   console.log(`  Disk items: ${stats.disk.items}`);
@@ -383,7 +416,7 @@ async function benchmarkMixedWorkload() {
   let writeCount = 0;
   let totalIdx = 0;
 
-  const mixed = await runBench("mixed workload (80/20 read/write)", 5000, async () => {
+  const mixed = await runBench("mixed workload (80/20 read/write)", 20000, async () => {
     const isWrite = Math.random() < 0.2;
     const key = `mixed:${totalIdx++ % 500}`;
 
@@ -398,10 +431,163 @@ async function benchmarkMixedWorkload() {
   console.log(formatResult(mixed));
   console.log(`  Reads: ${readCount}, Writes: ${writeCount}`);
 
+  await cache.flush();
   const stats = await cache.stats();
   console.log(`  Hit rate: ${(stats.hitRate * 100).toFixed(1)}%`);
 
   await cache.close();
+}
+
+async function benchmarkRedisComparison() {
+  if (!redis) {
+    console.log("\n=== Redis Comparison (SKIPPED - Redis not available) ===\n");
+    console.log("  To enable: start Redis on localhost:6379");
+    return;
+  }
+
+  console.log("\n=== Redis Comparison (localhost, includes network overhead) ===\n");
+
+  const smallValue = { id: 1, name: "test", data: "x".repeat(100) };
+  const mediumValue = { id: 1, name: "test", data: "x".repeat(1000) };
+
+  // --- fs-lru-cache: Memory hits ---
+  await cleanup();
+  const memCache = new FsLruCache({
+    dir: BENCH_DIR,
+    maxMemoryItems: 10000,
+    maxMemorySize: 100 * 1024 * 1024,
+  });
+
+  // Pre-populate fs-lru-cache
+  for (let i = 0; i < 1000; i++) {
+    await memCache.set(`key:${i}`, smallValue);
+  }
+
+  let fsIdx = 0;
+  const fsMemGet = await runBench("fs-lru-cache get() - memory hit", 50000, async () => {
+    await memCache.get(`key:${fsIdx++ % 1000}`);
+  });
+  console.log(formatResult(fsMemGet));
+
+  // --- Redis: GET ---
+  await cleanupRedis();
+  for (let i = 0; i < 1000; i++) {
+    await redis.set(`${REDIS_PREFIX}key:${i}`, JSON.stringify(smallValue));
+  }
+
+  let redisGetIdx = 0;
+  const redisGet = await runBench("redis GET (localhost)", 20000, async () => {
+    const val = await redis!.get(`${REDIS_PREFIX}key:${redisGetIdx++ % 1000}`);
+    if (val) JSON.parse(val); // Fair comparison: deserialize
+  });
+  console.log(formatResult(redisGet));
+
+  // --- fs-lru-cache: SET small ---
+  await cleanup();
+  const setCache = new FsLruCache({ dir: BENCH_DIR });
+
+  let fsSetIdx = 0;
+  const fsSet = await runBench("fs-lru-cache set() - small (100B)", 5000, async () => {
+    await setCache.set(`small:${fsSetIdx++}`, smallValue);
+  });
+  console.log(formatResult(fsSet));
+
+  // --- Redis: SET small ---
+  await cleanupRedis();
+  let redisSetIdx = 0;
+  const redisSet = await runBench("redis SET - small (100B)", 5000, async () => {
+    await redis!.set(
+      `${REDIS_PREFIX}small:${redisSetIdx++}`,
+      JSON.stringify(smallValue),
+    );
+  });
+  console.log(formatResult(redisSet));
+
+  // --- fs-lru-cache: SET medium ---
+  let fsMedIdx = 0;
+  const fsMedSet = await runBench("fs-lru-cache set() - medium (1KB)", 5000, async () => {
+    await setCache.set(`med:${fsMedIdx++}`, mediumValue);
+  });
+  console.log(formatResult(fsMedSet));
+
+  // --- Redis: SET medium ---
+  let redisMedIdx = 0;
+  const redisMedSet = await runBench("redis SET - medium (1KB)", 5000, async () => {
+    await redis!.set(
+      `${REDIS_PREFIX}med:${redisMedIdx++}`,
+      JSON.stringify(mediumValue),
+    );
+  });
+  console.log(formatResult(redisMedSet));
+
+  // --- Batch comparison: MSET ---
+  console.log("");
+
+  let fsMsetIdx = 0;
+  const fsMset = await runBench("fs-lru-cache mset() - 10 items", 2000, async () => {
+    const entries: [string, unknown][] = [];
+    for (let i = 0; i < 10; i++) {
+      entries.push([`batch:${fsMsetIdx++}`, smallValue]);
+    }
+    await setCache.mset(entries);
+  });
+  console.log(formatResult(fsMset));
+
+  let redisMsetIdx = 0;
+  const redisMset = await runBench("redis MSET - 10 items", 2000, async () => {
+    const args: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      args.push(`${REDIS_PREFIX}batch:${redisMsetIdx++}`, JSON.stringify(smallValue));
+    }
+    await redis!.mset(...args);
+  });
+  console.log(formatResult(redisMset));
+
+  // --- Mixed workload comparison ---
+  console.log("");
+
+  // fs-lru-cache mixed
+  await cleanup();
+  const mixedCache = new FsLruCache({ dir: BENCH_DIR, maxMemoryItems: 500 });
+  for (let i = 0; i < 500; i++) {
+    await mixedCache.set(`mixed:${i}`, smallValue);
+  }
+
+  let fsMixedIdx = 0;
+  const fsMixed = await runBench("fs-lru-cache mixed (80/20 r/w)", 20000, async () => {
+    const isWrite = Math.random() < 0.2;
+    const key = `mixed:${fsMixedIdx++ % 500}`;
+    if (isWrite) {
+      await mixedCache.set(key, { ...smallValue, ts: Date.now() });
+    } else {
+      await mixedCache.get(key);
+    }
+  });
+  console.log(formatResult(fsMixed));
+
+  // Redis mixed
+  await cleanupRedis();
+  for (let i = 0; i < 500; i++) {
+    await redis.set(`${REDIS_PREFIX}mixed:${i}`, JSON.stringify(smallValue));
+  }
+
+  let redisMixedIdx = 0;
+  const redisMixed = await runBench("redis mixed (80/20 r/w)", 20000, async () => {
+    const isWrite = Math.random() < 0.2;
+    const key = `${REDIS_PREFIX}mixed:${redisMixedIdx++ % 500}`;
+    if (isWrite) {
+      await redis!.set(key, JSON.stringify({ ...smallValue, ts: Date.now() }));
+    } else {
+      const val = await redis!.get(key);
+      if (val) JSON.parse(val);
+    }
+  });
+  console.log(formatResult(redisMixed));
+
+  await mixedCache.close();
+  await setCache.close();
+  await memCache.close();
+  await cleanupRedis();
 }
 
 async function main() {
@@ -410,7 +596,16 @@ async function main() {
   console.log("╚════════════════════════════════════════════════════════════════╝");
   console.log(`\nNode.js ${process.version}`);
   console.log(`Platform: ${process.platform} ${process.arch}`);
-  console.log(`Date: ${new Date().toISOString()}\n`);
+  console.log(`Date: ${new Date().toISOString()}`);
+
+  // Try to connect to Redis
+  const redisAvailable = await connectRedis();
+  if (redisAvailable) {
+    console.log(`Redis: connected (localhost:6379)`);
+  } else {
+    console.log(`Redis: not available (comparison benchmarks will be skipped)`);
+  }
+  console.log("");
 
   try {
     await benchmarkCoreOps();
@@ -421,10 +616,15 @@ async function main() {
     await benchmarkTTL();
     await benchmarkPatternMatching();
     await benchmarkMixedWorkload();
+    await benchmarkRedisComparison();
 
     console.log("\n=== Benchmark Complete ===\n");
   } finally {
     await cleanup();
+    if (redis) {
+      await cleanupRedis();
+      redis.disconnect();
+    }
   }
 }
 

@@ -14,7 +14,8 @@ const DEFAULT_OPTIONS = {
 	defaultTtl: void 0,
 	namespace: void 0,
 	gzip: false,
-	pruneInterval: void 0
+	pruneInterval: void 0,
+	syncWrites: false
 };
 
 //#endregion
@@ -658,7 +659,7 @@ var FileStore = class {
 * Features:
 * - Two-tier storage: hot items in memory, all items on disk
 * - Memory-first reads for fast access to frequently used data
-* - Write-through to disk for durability
+* - Async writes by default (memory updated immediately, disk in background)
 * - LRU eviction in both memory and disk stores
 * - TTL support with lazy expiration
 * - Stampede protection for concurrent operations
@@ -669,12 +670,21 @@ var FsLruCache = class {
 	maxMemorySize;
 	defaultTtl;
 	namespace;
+	syncWrites;
 	hits = 0;
 	misses = 0;
 	closed = false;
 	inFlight = /* @__PURE__ */ new Map();
+	/**
+	* Pending async disk writes per key.
+	* This is the primary source of truth for "intended state" during async writes.
+	* Contains the serialized value so reads can return it before disk write completes.
+	* Writes are chained: new writes wait for prior writes to the same key.
+	*/
+	pendingWrites = /* @__PURE__ */ new Map();
 	pruneTimer;
 	touchTimers = /* @__PURE__ */ new Map();
+	pendingTouches = /* @__PURE__ */ new Set();
 	touchDebounceMs = 5e3;
 	constructor(options = {}) {
 		const opts = {
@@ -684,6 +694,7 @@ var FsLruCache = class {
 		this.maxMemorySize = opts.maxMemorySize;
 		this.defaultTtl = opts.defaultTtl;
 		this.namespace = opts.namespace;
+		this.syncWrites = opts.syncWrites;
 		this.memory = new MemoryStore({
 			maxItems: opts.maxMemoryItems,
 			maxSize: opts.maxMemorySize
@@ -740,10 +751,19 @@ var FsLruCache = class {
 		if (this.touchTimers.has(key)) return;
 		const timer = setTimeout(() => {
 			this.touchTimers.delete(key);
-			if (!this.closed) this.files.touch(key).catch(() => {});
+			if (!this.closed) this.executeTouch(key);
 		}, this.touchDebounceMs);
 		timer.unref();
 		this.touchTimers.set(key, timer);
+	}
+	/**
+	* Execute a touch and track the promise for flush().
+	*/
+	executeTouch(key) {
+		const touchPromise = this.files.touch(key).then(() => {}).catch(() => {}).finally(() => {
+			this.pendingTouches.delete(touchPromise);
+		});
+		this.pendingTouches.add(touchPromise);
 	}
 	/**
 	* Cancel a pending debounced touch (used on delete/eviction).
@@ -754,6 +774,24 @@ var FsLruCache = class {
 			clearTimeout(timer);
 			this.touchTimers.delete(key);
 		}
+	}
+	/**
+	* Get a pending write if it exists and hasn't expired.
+	* Returns null if no pending write or if it's expired.
+	*/
+	getValidPendingWrite(key) {
+		const pending = this.pendingWrites.get(key);
+		if (!pending) return null;
+		if (isExpired(pending.expiresAt)) return null;
+		return pending;
+	}
+	/**
+	* Get all pending write keys matching a pattern.
+	*/
+	getPendingWriteKeys(compiled) {
+		const keys = [];
+		for (const [key, pending] of this.pendingWrites) if (!isExpired(pending.expiresAt) && matchPattern(key, compiled)) keys.push(key);
+		return keys;
 	}
 	/**
 	* Execute an operation with stampede protection.
@@ -772,11 +810,18 @@ var FsLruCache = class {
 	}
 	/**
 	* Get a value from the cache.
-	* Checks memory first, then disk (promoting to memory on hit).
+	* Checks pending writes first, then memory, then disk.
+	* This ensures read-after-write consistency even with async writes.
 	*/
 	async get(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		const pending = this.getValidPendingWrite(prefixedKey);
+		if (pending) {
+			this.hits++;
+			this.debouncedFileTouch(prefixedKey);
+			return JSON.parse(pending.serialized);
+		}
 		const memSerialized = this.memory.get(prefixedKey);
 		if (memSerialized !== null) {
 			this.hits++;
@@ -808,8 +853,21 @@ var FsLruCache = class {
 		if (valueSerialized === void 0) throw new TypeError(`Cannot cache value of type ${typeof value}. Value must be JSON-serializable.`);
 		const valueSize = Buffer.byteLength(valueSerialized, "utf8");
 		const entrySerialized = `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`;
-		await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
 		if (valueSize <= this.maxMemorySize) this.memory.set(prefixedKey, valueSerialized, expiresAt);
+		if (this.syncWrites) await this.files.set(prefixedKey, value, expiresAt, entrySerialized);
+		else {
+			const pendingWrite = {
+				serialized: valueSerialized,
+				expiresAt,
+				size: valueSize,
+				promise: (this.pendingWrites.get(prefixedKey)?.promise ?? Promise.resolve()).then(() => this.files.set(prefixedKey, value, expiresAt, entrySerialized)).catch(() => {
+					this.memory.delete(prefixedKey);
+				}).then(() => {
+					if (this.pendingWrites.get(prefixedKey) === pendingWrite) this.pendingWrites.delete(prefixedKey);
+				})
+			};
+			this.pendingWrites.set(prefixedKey, pendingWrite);
+		}
 	}
 	/**
 	* Delete a key from the cache.
@@ -818,27 +876,40 @@ var FsLruCache = class {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
 		this.cancelDebouncedTouch(prefixedKey);
+		const pending = this.pendingWrites.get(prefixedKey);
+		const hadPending = pending !== void 0 && !isExpired(pending.expiresAt);
+		this.pendingWrites.delete(prefixedKey);
 		const memDeleted = this.memory.delete(prefixedKey);
+		if (pending) await pending.promise;
 		const diskDeleted = await this.files.delete(prefixedKey);
-		return memDeleted || diskDeleted;
+		return hadPending || memDeleted || diskDeleted;
 	}
 	/**
 	* Check if a key exists in the cache.
+	* Checks pending writes first for consistency with async writes.
 	*/
 	async exists(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		if (this.getValidPendingWrite(prefixedKey)) return true;
 		return this.memory.has(prefixedKey) || await this.files.has(prefixedKey);
 	}
 	/**
 	* Get all keys matching a pattern.
+	* Includes keys with pending writes for consistency.
 	* @param pattern Glob-like pattern (supports * wildcard)
 	*/
 	async keys(pattern = "*") {
 		this.assertOpen();
 		const prefixedPattern = this.prefixKey(pattern);
+		const compiled = compilePattern(prefixedPattern);
+		const pendingKeys = this.getPendingWriteKeys(compiled);
 		const [memKeys, diskKeys] = await Promise.all([Promise.resolve(this.memory.keys(prefixedPattern)), this.files.keys(prefixedPattern)]);
-		return [...new Set([...memKeys, ...diskKeys])].map((k) => this.unprefixKey(k));
+		return [...new Set([
+			...pendingKeys,
+			...memKeys,
+			...diskKeys
+		])].map((k) => this.unprefixKey(k));
 	}
 	/**
 	* Set expiration time in seconds.
@@ -847,6 +918,8 @@ var FsLruCache = class {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
 		const expiresAt = Date.now() + seconds * 1e3;
+		const pending = this.pendingWrites.get(prefixedKey);
+		if (pending) await pending.promise;
 		if (!await this.files.setExpiry(prefixedKey, expiresAt)) return false;
 		this.memory.setExpiry(prefixedKey, expiresAt);
 		return true;
@@ -858,6 +931,8 @@ var FsLruCache = class {
 	async persist(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		const pending = this.pendingWrites.get(prefixedKey);
+		if (pending) await pending.promise;
 		if (!await this.files.setExpiry(prefixedKey, null)) return false;
 		this.memory.setExpiry(prefixedKey, null);
 		return true;
@@ -872,6 +947,11 @@ var FsLruCache = class {
 	async touch(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		if (this.getValidPendingWrite(prefixedKey)) {
+			this.debouncedFileTouch(prefixedKey);
+			this.memory.touch(prefixedKey);
+			return true;
+		}
 		if (!await this.files.touch(prefixedKey)) return false;
 		this.memory.touch(prefixedKey);
 		return true;
@@ -879,10 +959,16 @@ var FsLruCache = class {
 	/**
 	* Get TTL in seconds.
 	* Returns -1 if no expiry, -2 if key not found.
+	* Checks pending writes first for consistency.
 	*/
 	async ttl(key) {
 		this.assertOpen();
 		const prefixedKey = this.prefixKey(key);
+		const pending = this.getValidPendingWrite(prefixedKey);
+		if (pending) {
+			if (pending.expiresAt === null) return -1;
+			return Math.max(0, Math.ceil((pending.expiresAt - Date.now()) / 1e3));
+		}
 		const memTtlMs = this.memory.getTtl(prefixedKey);
 		if (memTtlMs !== -2) return memTtlMs < 0 ? memTtlMs : Math.ceil(memTtlMs / 1e3);
 		const fileTtlMs = await this.files.getTtl(prefixedKey);
@@ -918,8 +1004,22 @@ var FsLruCache = class {
 				entrySerialized: `{"key":${JSON.stringify(prefixedKey)},"value":${valueSerialized},"expiresAt":${expiresAt}}`
 			};
 		});
-		await Promise.all(prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)));
 		for (const p of prepared) if (p.valueSize <= this.maxMemorySize) this.memory.set(p.prefixedKey, p.valueSerialized, p.expiresAt);
+		if (this.syncWrites) await Promise.all(prepared.map((p) => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized)));
+		else for (const p of prepared) {
+			const diskWrite = (this.pendingWrites.get(p.prefixedKey)?.promise ?? Promise.resolve()).then(() => this.files.set(p.prefixedKey, p.value, p.expiresAt, p.entrySerialized));
+			const pendingWrite = {
+				serialized: p.valueSerialized,
+				expiresAt: p.expiresAt,
+				size: p.valueSize,
+				promise: diskWrite.catch(() => {
+					this.memory.delete(p.prefixedKey);
+				}).then(() => {
+					if (this.pendingWrites.get(p.prefixedKey) === pendingWrite) this.pendingWrites.delete(p.prefixedKey);
+				})
+			};
+			this.pendingWrites.set(p.prefixedKey, pendingWrite);
+		}
 	}
 	/**
 	* Get a value, or compute and set it if it doesn't exist (cache-aside pattern).
@@ -945,11 +1045,15 @@ var FsLruCache = class {
 	}
 	/**
 	* Get the total number of items in the cache.
-	* This is the count of items on disk (source of truth).
+	* Includes items with pending writes that haven't completed yet.
 	*/
 	async size() {
 		this.assertOpen();
-		return this.files.getItemCount();
+		const diskKeys = await this.files.keys();
+		const diskKeySet = new Set(diskKeys);
+		let count = diskKeySet.size;
+		for (const [key, pending] of this.pendingWrites) if (!isExpired(pending.expiresAt) && !diskKeySet.has(key)) count++;
+		return count;
 	}
 	/**
 	* Remove all expired entries from the cache.
@@ -963,6 +1067,8 @@ var FsLruCache = class {
 	}
 	/**
 	* Get cache statistics.
+	* Note: During async writes, disk stats may lag behind the actual state.
+	* Use flush() first if you need accurate post-write statistics.
 	*/
 	async stats() {
 		this.assertOpen();
@@ -982,7 +1088,8 @@ var FsLruCache = class {
 			disk: {
 				items: diskItemCount,
 				size: diskSize
-			}
+			},
+			pendingWrites: this.pendingWrites.size
 		};
 	}
 	/**
@@ -993,26 +1100,42 @@ var FsLruCache = class {
 		this.misses = 0;
 	}
 	/**
+	* Wait for all pending async writes and touches to complete.
+	* Useful when you need to ensure data is persisted before reading stats or shutting down.
+	*/
+	async flush() {
+		for (const [key, timer] of this.touchTimers) {
+			clearTimeout(timer);
+			this.touchTimers.delete(key);
+			this.executeTouch(key);
+		}
+		const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+		await Promise.all([...pendingWritePromises, ...this.pendingTouches]);
+	}
+	/**
 	* Clear all entries from the cache.
 	*/
 	async clear() {
 		this.assertOpen();
 		for (const timer of this.touchTimers.values()) clearTimeout(timer);
 		this.touchTimers.clear();
+		const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+		this.pendingWrites.clear();
 		this.memory.clear();
+		await Promise.all([...pendingWritePromises, ...this.pendingTouches]);
 		await this.files.clear();
 	}
 	/**
 	* Close the cache.
+	* Waits for pending writes to complete before closing.
 	* After closing, all operations will throw.
 	*/
 	async close() {
+		await this.flush();
 		if (this.pruneTimer) {
 			clearInterval(this.pruneTimer);
 			this.pruneTimer = void 0;
 		}
-		for (const timer of this.touchTimers.values()) clearTimeout(timer);
-		this.touchTimers.clear();
 		this.closed = true;
 		this.inFlight.clear();
 	}
