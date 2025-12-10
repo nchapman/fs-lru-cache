@@ -130,7 +130,7 @@ export class FileStore {
       }
 
       for (const file of files) {
-        if (!file.endsWith(".json")) continue;
+        if (!file.endsWith(".dat")) continue;
         await this.loadFile(shardDir, file);
       }
     };
@@ -154,7 +154,7 @@ export class FileStore {
         return;
       }
 
-      const hash = file.replace(".json", "");
+      const hash = file.replace(".dat", "");
       this.index.set(data.key, {
         hash,
         expiresAt: data.expiresAt,
@@ -173,7 +173,7 @@ export class FileStore {
    */
   private getFilePath(hash: string): string {
     const shardName = getShardName(getShardIndex(hash, this.shards));
-    return join(this.dir, shardName, `${hash}.json`);
+    return join(this.dir, shardName, `${hash}.dat`);
   }
 
   /**

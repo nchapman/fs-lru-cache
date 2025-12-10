@@ -309,7 +309,7 @@ var FileStore = class {
 				return;
 			}
 			for (const file of files) {
-				if (!file.endsWith(".json")) continue;
+				if (!file.endsWith(".dat")) continue;
 				await this.loadFile(shardDir, file);
 			}
 		};
@@ -328,7 +328,7 @@ var FileStore = class {
 				await fs.promises.unlink(filePath).catch(() => {});
 				return;
 			}
-			const hash = file.replace(".json", "");
+			const hash = file.replace(".dat", "");
 			this.index.set(data.key, {
 				hash,
 				expiresAt: data.expiresAt,
@@ -344,7 +344,7 @@ var FileStore = class {
 	*/
 	getFilePath(hash) {
 		const shardName = getShardName(getShardIndex(hash, this.shards));
-		return (0, path.join)(this.dir, shardName, `${hash}.json`);
+		return (0, path.join)(this.dir, shardName, `${hash}.dat`);
 	}
 	/**
 	* Generate a temporary file path for atomic writes
