@@ -287,16 +287,16 @@ When a collision occurs, the new key evicts the old one. The evicted key is remo
 
 Benchmarks on Apple M4 Max, Node.js v22. Numbers vary with hardware, value sizes, and access patterns.
 
-| Operation                  | fs-lru-cache   | Redis (localhost) |
-| -------------------------- | -------------- | ----------------- |
-| get (memory hit)           | ~1.5M ops/s    | ~40K ops/s        |
-| get (disk hit)             | ~7K ops/s      | ~40K ops/s        |
-| set (100B value)           | ~75K ops/s     | ~23K ops/s        |
-| set (1KB value)            | ~53K ops/s     | ~28K ops/s        |
-| mset (10 items)            | ~35K ops/s     | ~18K ops/s        |
-| getOrSet (hit)             | ~200K ops/s    | N/A               |
-| getOrSet (miss)            | ~1K ops/s      | N/A               |
-| mixed workload (80/20 r/w) | ~1.5M ops/s    | ~38K ops/s        |
+| Operation                  | fs-lru-cache | Redis (localhost) |
+| -------------------------- | ------------ | ----------------- |
+| get (memory hit)           | ~1.5M ops/s  | ~40K ops/s        |
+| get (disk hit)             | ~7K ops/s    | ~40K ops/s        |
+| set (100B value)           | ~75K ops/s   | ~23K ops/s        |
+| set (1KB value)            | ~53K ops/s   | ~28K ops/s        |
+| mset (10 items)            | ~35K ops/s   | ~18K ops/s        |
+| getOrSet (hit)             | ~200K ops/s  | N/A               |
+| getOrSet (miss)            | ~1K ops/s    | N/A               |
+| mixed workload (80/20 r/w) | ~1.5M ops/s  | ~38K ops/s        |
 
 **Key characteristics:**
 
