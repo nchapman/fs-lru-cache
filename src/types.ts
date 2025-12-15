@@ -28,6 +28,24 @@ export interface CacheOptions {
   pruneInterval?: number;
   /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
   syncWrites?: boolean;
+  /**
+   * Enable multi-process mode for sharing cache across processes (default: false).
+   * When enabled, the cache coordinates with other processes via a shared index file.
+   *
+   * @remarks
+   * **Multi-process behavior:**
+   * - Writes are immediately visible to the writing process
+   * - Other processes see writes within syncInterval ms
+   * - LRU ordering is approximate (each process tracks its own access times)
+   * - Size limits are approximate (may temporarily exceed by ~N×maxSize where N = process count)
+   * - Stampede protection works within a process only
+   */
+  multiProcess?: boolean;
+  /**
+   * Interval in ms to sync index with other processes (default: 1000).
+   * Only used when multiProcess is true.
+   */
+  syncInterval?: number;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -100,4 +118,33 @@ export const DEFAULT_OPTIONS = {
   gzip: false,
   pruneInterval: undefined as number | undefined,
   syncWrites: false,
+  multiProcess: false,
+  syncInterval: 1000,
 };
+
+/**
+ * Entry in the shared index file for multi-process coordination.
+ */
+export interface SharedIndexEntry {
+  /** Hash of the key (used as filename) */
+  hash: string;
+  /** Size of the compressed file in bytes */
+  size: number;
+  /** Expiration timestamp in ms, or null if no expiry */
+  expiresAt: number | null;
+  /** Last access timestamp in ms (for LRU ordering) */
+  lastAccessedAt: number;
+  /** Hash of the value content (to detect overwrites by other processes) */
+  valueHash?: string;
+}
+
+/**
+ * Shared index file format for multi-process coordination.
+ * Written to {cacheDir}/.index.json
+ */
+export interface SharedIndex {
+  /** Version number, incremented on every write */
+  version: number;
+  /** Map of key -> metadata */
+  entries: Record<string, SharedIndexEntry>;
+}

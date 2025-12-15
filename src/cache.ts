@@ -61,12 +61,21 @@ export class FsLruCache {
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
       gzip: opts.gzip,
+      multiProcess: opts.multiProcess,
+      syncInterval: opts.syncInterval,
       // Keep memory in sync: when disk evicts a key, remove from memory too.
       // This ensures memory is always a subset of disk (source of truth).
       onEvict: (key) => {
         this.memory.delete(key);
         this.cancelDebouncedTouch(key);
       },
+      // Invalidate memory cache when another process overwrites a value.
+      // The key still exists on disk, so only clear the stale memory entry.
+      onInvalidate: (key) => {
+        this.memory.delete(key);
+      },
+      // Called before index sync operations to ensure pending writes are on disk
+      onBeforeSync: () => this.flushPendingWrites(),
     });
 
     // Start background pruning if configured
@@ -708,6 +717,28 @@ export class FsLruCache {
   }
 
   /**
+   * Flush pending disk writes only (without touches).
+   * Used internally before index sync operations.
+   */
+  private async flushPendingWrites(): Promise<void> {
+    const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+    await Promise.all(pendingWritePromises);
+  }
+
+  /**
+   * Force immediate synchronization with the shared index file.
+   * This flushes all pending writes, writes the local index, and reads
+   * any changes from other processes sharing the same cache directory.
+   *
+   * Only useful when syncInterval > 0 (multi-process mode).
+   * Call this before critical reads that need the freshest data from other processes.
+   */
+  async forceSync(): Promise<void> {
+    this.assertOpen();
+    await this.files.sync();
+  }
+
+  /**
    * Clear all entries from the cache.
    */
   async clear(): Promise<void> {
@@ -744,6 +775,9 @@ export class FsLruCache {
    * After closing, all operations will throw.
    */
   async close(): Promise<void> {
+    // Mark as closed immediately to prevent new operations from starting
+    this.closed = true;
+
     // Wait for all pending async writes and touches to complete
     await this.flush();
 
@@ -751,7 +785,10 @@ export class FsLruCache {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
-    this.closed = true;
+
+    // Close file store (stops sync timer, flushes index)
+    await this.files.close();
+
     this.inFlight.clear();
   }
 }

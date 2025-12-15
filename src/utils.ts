@@ -15,6 +15,14 @@ export function hashKey(key: string): string {
 }
 
 /**
+ * Generate a hash for a cache value (for change detection in multi-process sync).
+ * Returns a 16-character hex string (64 bits - sufficient for change detection).
+ */
+export function hashValue(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+
+/**
  * Get the shard index from a hash
  */
 export function getShardIndex(hash: string, shardCount: number): number {
