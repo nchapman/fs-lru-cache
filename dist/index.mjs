@@ -685,7 +685,7 @@ var FsLruCache = class {
 	pruneTimer;
 	touchTimers = /* @__PURE__ */ new Map();
 	pendingTouches = /* @__PURE__ */ new Set();
-	touchDebounceMs = 5e3;
+	touchDebounceMs = 1e3;
 	constructor(options = {}) {
 		const opts = {
 			...DEFAULT_OPTIONS,
