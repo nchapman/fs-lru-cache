@@ -18,7 +18,7 @@ function createSyncCache(name: string, syncInterval = 100): FsLruCache {
     maxDiskSize: 1024 * 1024,
     shards: 4,
     syncWrites: true,
-    multiProcess: true,
+    experimentalMultiProcess: true,
     syncInterval,
   });
 }
@@ -33,14 +33,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000, // Long interval - we'll use forceSync
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -73,14 +73,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -114,14 +114,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -159,14 +159,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -209,14 +209,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 50, // Fast sync for testing
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 50,
       });
 
@@ -264,7 +264,7 @@ describe("Multi-process sync", () => {
       const cache = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: false, // Disabled
+        experimentalMultiProcess: false, // Disabled
       });
 
       try {
@@ -286,7 +286,7 @@ describe("Multi-process sync", () => {
       const cache1 = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
@@ -299,7 +299,7 @@ describe("Multi-process sync", () => {
       const cache2 = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
@@ -321,14 +321,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -356,14 +356,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -393,7 +393,7 @@ describe("Multi-process sync", () => {
       const cache1 = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 10000, // Very long - relies on close() flushing
       });
 
@@ -404,7 +404,7 @@ describe("Multi-process sync", () => {
       const cache2 = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
@@ -424,14 +424,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
@@ -455,7 +455,7 @@ describe("Multi-process sync", () => {
       const cache = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 100,
       });
 
@@ -482,7 +482,7 @@ describe("Multi-process sync", () => {
       const cache = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -490,11 +490,7 @@ describe("Multi-process sync", () => {
         await cache.set("key1", "value1");
 
         // Call forceSync multiple times concurrently
-        const syncs = Promise.all([
-          cache.forceSync(),
-          cache.forceSync(),
-          cache.forceSync(),
-        ]);
+        const syncs = Promise.all([cache.forceSync(), cache.forceSync(), cache.forceSync()]);
 
         // Should not throw or deadlock
         await syncs;
@@ -511,13 +507,15 @@ describe("Multi-process sync", () => {
       registerCleanup(dir);
 
       // Create multiple cache instances
-      const caches = Array.from({ length: 3 }, () =>
-        new FsLruCache({
-          dir,
-          syncWrites: true,
-          multiProcess: true,
-          syncInterval: 1000,
-        }),
+      const caches = Array.from(
+        { length: 3 },
+        () =>
+          new FsLruCache({
+            dir,
+            syncWrites: true,
+            experimentalMultiProcess: true,
+            syncInterval: 1000,
+          }),
       );
 
       try {
@@ -551,14 +549,14 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
       const cacheB = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
       });
 
@@ -594,7 +592,7 @@ describe("Multi-process sync", () => {
       const cache = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
         maxDiskSize: 100 * 1024 * 1024, // 100MB
       });
@@ -630,7 +628,7 @@ describe("Multi-process sync", () => {
       const cacheA = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 1000,
         maxDiskSize: 100 * 1024 * 1024,
       });
@@ -648,7 +646,7 @@ describe("Multi-process sync", () => {
         const cacheB = new FsLruCache({
           dir,
           syncWrites: true,
-          multiProcess: true,
+          experimentalMultiProcess: true,
           syncInterval: 1000,
           maxDiskSize: 100 * 1024 * 1024,
         });
@@ -676,7 +674,7 @@ describe("Multi-process sync", () => {
       const cache = new FsLruCache({
         dir,
         syncWrites: true,
-        multiProcess: true,
+        experimentalMultiProcess: true,
         syncInterval: 10000, // Long interval
       });
 

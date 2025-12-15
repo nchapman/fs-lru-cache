@@ -7,11 +7,13 @@ This document describes how `fs-lru-cache` enables multiple Node.js processes to
 ## The Problem
 
 In single-process mode, each cache instance maintains an in-memory index that tracks:
+
 - Which keys exist on disk
 - File metadata (size, hash, expiration, last access time)
 - Total disk usage
 
 When multiple processes share a cache directory without coordination:
+
 - **Index divergence**: Each process has a different view of what's on disk
 - **Lost writes**: Process A's writes are invisible to Process B's index
 - **Inconsistent evictions**: Processes make eviction decisions based on incomplete information
@@ -73,7 +75,7 @@ The `valueHash` field is a 16-character truncated SHA-256 hash of the serialized
 
 ### Sync Mechanism
 
-When `multiProcess: true` is configured:
+When `experimentalMultiProcess: true` is configured:
 
 1. **Periodic Timer**: Every `syncInterval` ms, each process:
    - Flushes pending async writes
@@ -121,11 +123,13 @@ When `multiProcess: true` is configured:
 **Decision**: Eventual consistency instead of strong consistency
 
 **Rationale**:
+
 - Strong consistency requires distributed locks (complex, slower)
 - Caches are ephemeral by nature - occasional stale reads are acceptable
 - Better availability and performance
 
 **Implications**:
+
 - Writes visible to writer immediately
 - Other processes see writes within `syncInterval` ms
 - LRU ordering is approximate
@@ -136,6 +140,7 @@ When `multiProcess: true` is configured:
 **Decision**: Retry on conflict instead of locking
 
 **Implementation**:
+
 ```typescript
 for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
   // Read-modify-write
@@ -159,16 +164,19 @@ for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
 ```
 
 **Verification Logic**: We only verify key presence, not `valueHash`, because:
+
 1. Same key = same file path (hash is based on key, not value)
 2. If another process wrote a different value for our key, that's expected last-write-wins behavior at the file system level
 3. The goal is to ensure our keys weren't completely lost from the index
 
 **Benefits**:
+
 - No lock files to manage
 - No deadlock risk
 - Better performance when contention is low
 
 **Drawbacks**:
+
 - Under high contention, some writes may be lost after retries
 - Not suitable for scenarios requiring guaranteed writes
 
@@ -179,6 +187,7 @@ for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
 **Problem**: When Process B overwrites a key that Process A has in memory cache, Process A's memory cache becomes stale. Without change detection, reads would return stale data.
 
 **Solution**:
+
 ```typescript
 // During merge, detect if value changed
 if (existing.valueHash !== entry.valueHash) {
@@ -190,12 +199,14 @@ if (existing.valueHash !== entry.valueHash) {
 ```
 
 **Callback Separation**: The implementation uses two distinct callbacks:
+
 - `onEvict`: Called when a key is removed from disk (LRU eviction, collision, deletion by another process)
 - `onInvalidate`: Called when a key's value changed but the key still exists (overwritten by another process)
 
 This separation provides clearer semantics and allows different handling (e.g., `onEvict` cancels pending touches, `onInvalidate` only clears memory).
 
 **Benefits**:
+
 - Memory cache automatically invalidated when values change
 - Reads after `forceSync()` return fresh data
 - Low overhead (16-char hash per entry)
@@ -208,6 +219,7 @@ This separation provides clearer semantics and allows different handling (e.g., 
 **Problem**: Verifying all entries on every sync is expensive. With 10,000 entries, batch verification takes ~2 seconds.
 
 **Solution**:
+
 - **During write**: Only verify entries from other processes that we don't have locally
 - **During merge**: Only verify entries from shared index that we don't have locally
 - **Local entries**: Known to exist (either our version or another process's version at the same file path)
@@ -221,6 +233,7 @@ This separation provides clearer semantics and allows different handling (e.g., 
 **Problem**: With 10,000 entries, sequential `fs.access()` calls are slow
 
 **Solution**:
+
 ```typescript
 async filterExistingFiles(entries) {
   const BATCH_SIZE = 100;
@@ -251,6 +264,7 @@ async filterExistingFiles(entries) {
 **Problem**: `forceSync()` + automatic timer could run simultaneously
 
 **Solution**:
+
 ```typescript
 private syncInProgress?: Promise<void>;
 
@@ -273,11 +287,13 @@ async sync() {
 **Decision**: Files on disk are authoritative, not the index
 
 **Rationale**:
+
 - Processes can crash mid-operation
 - Index can become stale
 - Files are what users care about
 
 **Implementation**:
+
 - On startup, verify each entry's file exists before loading
 - During merge, verify foreign entries' files exist
 - Skip entries whose files are missing
@@ -290,6 +306,7 @@ async sync() {
 **Problem**: Original implementation used throttle-like behavior where continuous writes could starve index updates.
 
 **Solution**:
+
 ```typescript
 private scheduleIndexWrite(): void {
   const debounceMs = Math.min(100, this.syncInterval);
@@ -319,6 +336,7 @@ private scheduleIndexWrite(): void {
 ```
 
 **Benefits**:
+
 - Coalesces rapid mutations (reduces disk I/O)
 - Guarantees index is written within `syncInterval` ms
 - Prevents starvation under continuous load
@@ -330,6 +348,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: Process A and B both write `.index.json` simultaneously
 
 **Handling**:
+
 - Atomic writes (temp file + rename) prevent corruption
 - Optimistic concurrency detects overwrites
 - Retry with exponential backoff
@@ -340,6 +359,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: Process crashes after writing file but before updating index
 
 **Handling**:
+
 - File becomes "orphaned" - not in any index
 - Eventually discovered when:
   - Same key is written again
@@ -353,6 +373,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: Process A deletes file, Process B's index still has it
 
 **Handling**:
+
 - During sync, verify files exist via `fs.access()`
 - Remove entries from index if file missing
 - Call `onEvict` callback to clear memory cache
@@ -362,6 +383,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: Process A has key in memory, Process B overwrites same key with different value
 
 **Handling**:
+
 - During merge, compare `valueHash` fields
 - If `valueHash` differs, call `onInvalidate` to invalidate memory cache
 - Next read fetches fresh value from disk
@@ -371,6 +393,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: Disk error, invalid JSON, partial write
 
 **Handling**:
+
 - Try-catch around all index reads
 - Fall back to full directory scan (`loadIndex()`)
 - Rebuild index from actual files on disk
@@ -380,6 +403,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: 10 processes writing simultaneously
 
 **Behavior**:
+
 - Optimistic concurrency retries (max 3 attempts)
 - Some writes may be lost after exhausting retries
 - Eventual consistency - entries propagate over time
@@ -391,6 +415,7 @@ private scheduleIndexWrite(): void {
 **Scenario**: `close()` called while sync is in progress
 
 **Handling**:
+
 - Set `closed = true` immediately to prevent new operations from starting
 - Wait for any `syncInProgress` to complete
 - Wait for any `pendingIndexWrite` to complete
@@ -401,14 +426,15 @@ private scheduleIndexWrite(): void {
 ### Sync Cost
 
 | Entries | Sequential `fs.access` | Batched (100) | Improvement |
-|---------|------------------------|---------------|-------------|
-| 100     | ~100ms                | ~50ms         | 2x          |
-| 1,000   | ~1s                   | ~200ms        | 5x          |
-| 10,000  | ~30s                  | ~2s           | 15x         |
+| ------- | ---------------------- | ------------- | ----------- |
+| 100     | ~100ms                 | ~50ms         | 2x          |
+| 1,000   | ~1s                    | ~200ms        | 5x          |
+| 10,000  | ~30s                   | ~2s           | 15x         |
 
 ### Optimized Verification
 
 With foreign-only verification, actual sync cost depends on overlap:
+
 - **High overlap** (processes share most keys): Very fast, minimal verification
 - **Low overlap** (processes have unique keys): Proportional to foreign entries
 - **Typical case**: 50-90% faster than verifying all entries
@@ -459,6 +485,7 @@ With foreign-only verification, actual sync cost depends on overlap:
 ### File Store Changes
 
 **src/file-store.ts**:
+
 - `writeSharedIndex()`: Write local index to disk (with merge + retry)
 - `mergeSharedIndex()`: Read shared index and update local, invalidate memory on value change
 - `filterExistingFiles()`: Batch verify file existence
@@ -471,6 +498,7 @@ With foreign-only verification, actual sync cost depends on overlap:
 ### Cache Layer Changes
 
 **src/cache.ts**:
+
 - `forceSync()`: Public API for manual sync
 - `flushPendingWrites()`: Ensure writes on disk before index sync
 - `onBeforeSync` callback: Wire FileStore to cache for flush
@@ -480,14 +508,16 @@ With foreign-only verification, actual sync cost depends on overlap:
 ### Type Definitions
 
 **src/types.ts**:
+
 - `SharedIndex`: Index file structure
 - `SharedIndexEntry`: Per-key metadata including `valueHash`
-- `multiProcess` option: Enable multi-process mode
-- `syncInterval` option: Configure sync frequency (only used when `multiProcess: true`)
+- `experimentalMultiProcess` option: Enable experimental multi-process mode
+- `syncInterval` option: Configure sync frequency (only used when `experimentalMultiProcess: true`)
 
 ### Utility Functions
 
 **src/utils.ts**:
+
 - `hashValue()`: Compute 16-char content hash for change detection
 
 ## Usage Examples
@@ -496,13 +526,13 @@ With foreign-only verification, actual sync cost depends on overlap:
 
 ```typescript
 const cache = new FsLruCache({
-  dir: '/shared/cache',
-  multiProcess: true,  // Enable multi-process mode
-  syncInterval: 1000,  // Sync every 1 second (default)
+  dir: "/shared/cache",
+  experimentalMultiProcess: true, // Enable experimental multi-process mode
+  syncInterval: 1000, // Sync every 1 second (default)
 });
 
 // Writes immediately visible locally
-await cache.set('key1', 'value1');
+await cache.set("key1", "value1");
 
 // Other processes see it within 1 second
 ```
@@ -512,7 +542,7 @@ await cache.set('key1', 'value1');
 ```typescript
 // Before critical read
 await cache.forceSync();
-const value = await cache.get('key1'); // Fresh from other processes
+const value = await cache.get("key1"); // Fresh from other processes
 
 // After batch writes
 await cache.mset(entries);
@@ -525,7 +555,7 @@ await cache.forceSync(); // Make visible to others
 // In each worker
 const cache = new FsLruCache({
   dir: process.env.CACHE_DIR,
-  multiProcess: true,
+  experimentalMultiProcess: true,
   syncInterval: 500, // Fast sync for cluster
 });
 
@@ -553,6 +583,7 @@ const cache = new FsLruCache({
 **tests/sync.test.ts**: 19 tests covering multi-process scenarios
 
 Run tests:
+
 ```bash
 npm test tests/sync.test.ts
 ```
@@ -569,7 +600,7 @@ cat .cache/.index.json | jq '.'
 
 ```typescript
 // Log sync events (not implemented, but could add)
-cache.on('sync', ({ added, removed, version }) => {
+cache.on("sync", ({ added, removed, version }) => {
   console.log(`Synced to v${version}: +${added.length} -${removed.length}`);
 });
 ```
@@ -578,8 +609,8 @@ cache.on('sync', ({ added, removed, version }) => {
 
 ```typescript
 // Compare multiple processes
-const cacheA = new FsLruCache({ dir, multiProcess: true });
-const cacheB = new FsLruCache({ dir, multiProcess: true });
+const cacheA = new FsLruCache({ dir, experimentalMultiProcess: true });
+const cacheB = new FsLruCache({ dir, experimentalMultiProcess: true });
 
 await cacheA.forceSync();
 await cacheB.forceSync();
@@ -619,6 +650,7 @@ console.log(await cacheB.keys()); // Should match
 The multi-process sync implementation enables multiple Node.js processes to share a cache directory through a shared index file, periodic synchronization, and optimistic concurrency control. It prioritizes availability and performance over strong consistency, making it suitable for cache workloads where eventual consistency is acceptable.
 
 Key innovations:
+
 - **Value change detection** via `valueHash` for memory cache coherence
 - **Optimized file verification** (foreign entries only) for performance
 - **True debounce with max wait** for index writes
@@ -628,4 +660,4 @@ Key innovations:
 - **File-based source of truth** for crash recovery
 - **Graceful shutdown** with proper synchronization
 
-The implementation maintains backward compatibility (`multiProcess: false` by default, no overhead for single-process usage).
+The implementation maintains backward compatibility (`experimentalMultiProcess: false` by default, no overhead for single-process usage).

@@ -29,6 +29,24 @@ interface CacheOptions {
   pruneInterval?: number;
   /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
   syncWrites?: boolean;
+  /**
+   * Enable experimental multi-process mode for sharing cache across processes (default: false).
+   * When enabled, the cache coordinates with other processes via a shared index file.
+   *
+   * @remarks
+   * **Experimental multi-process behavior:**
+   * - Writes are immediately visible to the writing process
+   * - Other processes see writes within syncInterval ms
+   * - LRU ordering is approximate (each process tracks its own access times)
+   * - Size limits are approximate (may temporarily exceed by ~N×maxSize where N = process count)
+   * - Stampede protection works within a process only
+   */
+  experimentalMultiProcess?: boolean;
+  /**
+   * Interval in ms to sync index with other processes (default: 1000).
+   * Only used when experimentalMultiProcess is true.
+   */
+  syncInterval?: number;
 }
 interface CacheEntry<T = unknown> {
   /** The cache key */
@@ -71,6 +89,8 @@ declare const DEFAULT_OPTIONS: {
   gzip: boolean;
   pruneInterval: number | undefined;
   syncWrites: boolean;
+  experimentalMultiProcess: boolean;
+  syncInterval: number;
 };
 //#endregion
 //#region src/cache.d.ts
@@ -250,6 +270,20 @@ declare class FsLruCache {
    * Useful when you need to ensure data is persisted before reading stats or shutting down.
    */
   flush(): Promise<void>;
+  /**
+   * Flush pending disk writes only (without touches).
+   * Used internally before index sync operations.
+   */
+  private flushPendingWrites;
+  /**
+   * Force immediate synchronization with the shared index file.
+   * This flushes all pending writes, writes the local index, and reads
+   * any changes from other processes sharing the same cache directory.
+   *
+   * Only useful when syncInterval > 0 (multi-process mode).
+   * Call this before critical reads that need the freshest data from other processes.
+   */
+  forceSync(): Promise<void>;
   /**
    * Clear all entries from the cache.
    */

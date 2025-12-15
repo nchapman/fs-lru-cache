@@ -42,12 +42,12 @@ export interface FileStoreOptions {
    */
   onInvalidate?: (key: string) => void;
   /**
-   * Enable multi-process mode for sharing cache across processes.
+   * Enable experimental multi-process mode for sharing cache across processes.
    */
-  multiProcess?: boolean;
+  experimentalMultiProcess?: boolean;
   /**
    * Interval in ms to sync index with other processes (default: 1000).
-   * Only used when multiProcess is true.
+   * Only used when experimentalMultiProcess is true.
    */
   syncInterval?: number;
   /**
@@ -76,7 +76,7 @@ export class FileStore {
   private readonly gzip: boolean;
   private readonly onEvict?: (key: string) => void;
   private readonly onInvalidate?: (key: string) => void;
-  private readonly multiProcess: boolean;
+  private readonly experimentalMultiProcess: boolean;
   private readonly syncInterval: number;
   private readonly onBeforeSync?: () => Promise<void>;
   private initialized = false;
@@ -102,7 +102,7 @@ export class FileStore {
     this.gzip = options.gzip ?? false;
     this.onEvict = options.onEvict;
     this.onInvalidate = options.onInvalidate;
-    this.multiProcess = options.multiProcess ?? false;
+    this.experimentalMultiProcess = options.experimentalMultiProcess ?? false;
     this.syncInterval = options.syncInterval ?? 1000;
     this.onBeforeSync = options.onBeforeSync;
   }
@@ -153,8 +153,8 @@ export class FileStore {
       await this.loadIndex();
     }
 
-    // Start sync timer if multi-process mode is enabled
-    if (this.multiProcess) {
+    // Start sync timer if experimental multi-process mode is enabled
+    if (this.experimentalMultiProcess) {
       this.syncTimer = setInterval(() => {
         this.sync().catch(() => {});
       }, this.syncInterval);
@@ -372,7 +372,7 @@ export class FileStore {
       expiresAt,
       lastAccessedAt: Date.now(),
       size,
-      valueHash: this.multiProcess ? hashValue(serialized) : undefined,
+      valueHash: this.experimentalMultiProcess ? hashValue(serialized) : undefined,
     });
     this.hashToKey.set(hash, key);
     this.totalSize += size;
@@ -466,7 +466,7 @@ export class FileStore {
       this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
       indexEntry.size = newSize;
-      if (this.multiProcess) {
+      if (this.experimentalMultiProcess) {
         indexEntry.valueHash = hashValue(serialized);
       }
       this.markIndexDirty();
@@ -673,7 +673,7 @@ export class FileStore {
    * Verifies that files exist on disk to handle crashes during deletion.
    */
   private async loadSharedIndex(): Promise<boolean> {
-    if (!this.multiProcess) return false;
+    if (!this.experimentalMultiProcess) return false;
 
     try {
       const content = await fs.readFile(this.getSharedIndexPath(), "utf8");
@@ -858,7 +858,7 @@ export class FileStore {
    * Uses true debounce (resets timer on each write) with a max wait time.
    */
   private scheduleIndexWrite(): void {
-    if (!this.multiProcess) return;
+    if (!this.experimentalMultiProcess) return;
 
     this.indexDirty = true;
 
@@ -1094,7 +1094,7 @@ export class FileStore {
     }
 
     // Final index write if still dirty after waiting
-    if (this.indexDirty && this.multiProcess) {
+    if (this.indexDirty && this.experimentalMultiProcess) {
       await this.onBeforeSync?.();
       await this.writeSharedIndex();
     }

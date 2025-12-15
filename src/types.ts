@@ -29,21 +29,21 @@ export interface CacheOptions {
   /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
   syncWrites?: boolean;
   /**
-   * Enable multi-process mode for sharing cache across processes (default: false).
+   * Enable experimental multi-process mode for sharing cache across processes (default: false).
    * When enabled, the cache coordinates with other processes via a shared index file.
    *
    * @remarks
-   * **Multi-process behavior:**
+   * **Experimental multi-process behavior:**
    * - Writes are immediately visible to the writing process
    * - Other processes see writes within syncInterval ms
    * - LRU ordering is approximate (each process tracks its own access times)
    * - Size limits are approximate (may temporarily exceed by ~N×maxSize where N = process count)
    * - Stampede protection works within a process only
    */
-  multiProcess?: boolean;
+  experimentalMultiProcess?: boolean;
   /**
    * Interval in ms to sync index with other processes (default: 1000).
-   * Only used when multiProcess is true.
+   * Only used when experimentalMultiProcess is true.
    */
   syncInterval?: number;
 }
@@ -118,7 +118,7 @@ export const DEFAULT_OPTIONS = {
   gzip: false,
   pruneInterval: undefined as number | undefined,
   syncWrites: false,
-  multiProcess: false,
+  experimentalMultiProcess: false,
   syncInterval: 1000,
 };
 

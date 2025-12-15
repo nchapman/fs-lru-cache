@@ -61,7 +61,7 @@ export class FsLruCache {
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
       gzip: opts.gzip,
-      multiProcess: opts.multiProcess,
+      experimentalMultiProcess: opts.experimentalMultiProcess,
       syncInterval: opts.syncInterval,
       // Keep memory in sync: when disk evicts a key, remove from memory too.
       // This ensures memory is always a subset of disk (source of truth).

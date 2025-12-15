@@ -180,12 +180,12 @@ new FsLruCache({
   // When false, writes return immediately after updating memory. When true, writes wait for disk persistence
   syncWrites: false,
 
-  // Enable multi-process mode. Default: false
+  // Enable experimental multi-process mode. Default: false
   // When enabled, multiple processes can share the same cache directory
-  multiProcess: true,
+  experimentalMultiProcess: true,
 
   // Multi-process sync interval in milliseconds. Default: 1000
-  // Only used when multiProcess is true
+  // Only used when experimentalMultiProcess is true
   syncInterval: 1000,
 });
 ```
@@ -234,15 +234,15 @@ TTL is tracked as an `expiresAt` timestamp. Expiration is lazy—items aren't re
 
 Enable `pruneInterval` for automatic background pruning at a specified interval in milliseconds.
 
-## Multi-Process Support
+## Multi-Process Support (Experimental)
 
-Multiple Node.js processes can share the same cache directory using a shared index file. Enable with `multiProcess: true`:
+Multiple Node.js processes on the same machine can share a cache directory using a shared index file. This feature is experimental—the API may change and edge cases may exist.
 
 ```typescript
 const cache = new FsLruCache({
-  dir: "/shared/cache",
-  multiProcess: true,  // Enable multi-process mode
-  syncInterval: 1000,  // Sync every 1 second (default)
+  dir: "/var/cache/myapp",
+  experimentalMultiProcess: true,
+  syncInterval: 1000, // Sync every 1 second (default)
 });
 
 // Force immediate sync when you need fresh data
@@ -251,15 +251,21 @@ await cache.forceSync();
 
 Each process periodically writes its index to `.index.json` and merges changes from other processes. This provides **eventual consistency**—writes are visible to other processes within `syncInterval` milliseconds.
 
+**Requirements:**
+
+- **Local filesystem only.** Requires a POSIX-compliant filesystem with atomic rename. NFS, network shares, and distributed filesystems are not supported—`fs.rename()` atomicity is not guaranteed on these systems.
+- **Single machine.** All processes must run on the same host sharing a local directory.
+
 **Trade-offs:**
 
+- Eventual consistency only—no strong consistency guarantees
 - Stampede protection is per-process only
 - LRU ordering and size limits are approximate across processes
-- Works best when processes mostly access different keys
+- Under high write contention, some index updates may be lost
 
-**Good for:** PM2 cluster mode, multiple services sharing a cache, read-heavy workloads.
+**Good for:** PM2 cluster mode, Node.js worker threads, multiple local services sharing a cache.
 
-**Not for:** Strong consistency requirements—use Redis instead.
+**Not for:** Distributed systems, network storage, or strong consistency requirements—use Redis instead.
 
 See [docs/MULTI_PROCESS_SYNC.md](docs/MULTI_PROCESS_SYNC.md) for implementation details.
 
