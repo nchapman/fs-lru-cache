@@ -20,10 +20,14 @@ await cache.get("user:1"); // { name: "Alice", email: "alice@example.com" }
 await cache.set("session:abc", { userId: 1, role: "admin" }, 3600);
 
 // Fetch and cache with stampede protection
-const user = await cache.getOrSet("user:1", async () => {
-  const res = await fetch("https://api.example.com/users/1");
-  return res.json();
-}, 60);
+const user = await cache.getOrSet(
+  "user:1",
+  async () => {
+    const res = await fetch("https://api.example.com/users/1");
+    return res.json();
+  },
+  60,
+);
 ```
 
 ## API Reference

@@ -42,7 +42,7 @@ export class FsLruCache {
   // Debounced touch timers for file store LRU updates
   private touchTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private pendingTouches = new Set<Promise<void>>();
-  private readonly touchDebounceMs = 5000;
+  private readonly touchDebounceMs = 1000;
 
   constructor(options: CacheOptions = {}) {
     const opts = { ...DEFAULT_OPTIONS, ...options };
