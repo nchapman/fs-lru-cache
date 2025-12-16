@@ -699,26 +699,15 @@ var FileStore = class {
 	async loadSharedIndex() {
 		if (!this.experimentalMultiProcess) return false;
 		try {
-			const content = await fs.promises.readFile(this.getSharedIndexPath(), "utf8");
-			const sharedIndex = JSON.parse(content);
+			const sharedIndex = await this.readSharedIndexWithRetry();
+			if (!sharedIndex) return false;
 			const now = Date.now();
 			const nonExpiredEntries = Object.entries(sharedIndex.entries).filter(([, entry]) => entry.expiresAt === null || entry.expiresAt > now);
 			const verifiedEntries = await this.filterExistingFiles(nonExpiredEntries);
 			this.index.clear();
 			this.hashToKey.clear();
 			this.totalSize = 0;
-			for (const [key, entry] of verifiedEntries) {
-				const indexEntry = {
-					hash: entry.hash,
-					size: entry.size,
-					expiresAt: entry.expiresAt,
-					lastAccessedAt: entry.lastAccessedAt,
-					valueHash: entry.valueHash
-				};
-				this.index.set(key, indexEntry);
-				this.hashToKey.set(entry.hash, key);
-				this.totalSize += entry.size;
-			}
+			for (const [key, entry] of verifiedEntries) this.addForeignEntry(key, entry);
 			this.indexVersion = sharedIndex.version;
 			return true;
 		} catch {
@@ -749,31 +738,151 @@ var FileStore = class {
 		return existing;
 	}
 	/**
+	* Read the shared index file with retry logic for transient failures.
+	* Distinguishes between "file not found" (expected, no retry) and
+	* parse errors (possible torn read, retry with backoff).
+	*/
+	async readSharedIndexWithRetry(maxRetries = 3) {
+		for (let attempt = 0; attempt < maxRetries; attempt++) try {
+			const content = await fs.promises.readFile(this.getSharedIndexPath(), "utf8");
+			return JSON.parse(content);
+		} catch (err) {
+			if (err instanceof Error && "code" in err && err.code === "ENOENT") return null;
+			if (attempt < maxRetries - 1) {
+				const backoffMs = Math.min(5 * Math.pow(2, attempt) + Math.random() * 5, 50);
+				await new Promise((r) => setTimeout(r, backoffMs));
+				continue;
+			}
+			return null;
+		}
+		return null;
+	}
+	/**
+	* Capture a point-in-time snapshot of the local index state.
+	* Used to guard against concurrent modifications during sync operations.
+	*/
+	snapshotLocalIndex() {
+		return {
+			keys: new Set(this.index.keys()),
+			entries: new Map(this.index)
+		};
+	}
+	/**
+	* Pure function to merge local entries with foreign entries for writing.
+	* Foreign entries are added first, then local entries overlay (take precedence).
+	*/
+	buildMergedEntries(localEntries, foreignEntries) {
+		const entries = {};
+		for (const [key, entry] of foreignEntries) entries[key] = entry;
+		for (const [key, entry] of localEntries) entries[key] = {
+			hash: entry.hash,
+			size: entry.size,
+			expiresAt: entry.expiresAt,
+			lastAccessedAt: entry.lastAccessedAt,
+			valueHash: entry.valueHash
+		};
+		return entries;
+	}
+	/**
+	* Add an entry from another process to the local index.
+	*/
+	addForeignEntry(key, entry) {
+		const indexEntry = {
+			hash: entry.hash,
+			size: entry.size,
+			expiresAt: entry.expiresAt,
+			lastAccessedAt: entry.lastAccessedAt,
+			valueHash: entry.valueHash
+		};
+		this.index.set(key, indexEntry);
+		this.hashToKey.set(entry.hash, key);
+		this.totalSize += entry.size;
+	}
+	/**
+	* Update an existing local entry with data from the shared index.
+	* Calls onInvalidate if the value changed (different valueHash).
+	*/
+	updateLocalEntryFromShared(key, sharedEntry) {
+		const existing = this.index.get(key);
+		if (!existing) return;
+		if (sharedEntry.valueHash && existing.valueHash !== sharedEntry.valueHash) {
+			existing.valueHash = sharedEntry.valueHash;
+			try {
+				this.onInvalidate?.(key);
+			} catch {}
+		}
+		this.totalSize -= existing.size;
+		this.totalSize += sharedEntry.size;
+		existing.size = sharedEntry.size;
+		existing.expiresAt = sharedEntry.expiresAt;
+		if (sharedEntry.lastAccessedAt > existing.lastAccessedAt) existing.lastAccessedAt = sharedEntry.lastAccessedAt;
+	}
+	/**
+	* Remove keys that were deleted by other processes.
+	* Checks if files still exist before removing (handles race conditions).
+	*/
+	async removeDeletedKeys(sharedKeys) {
+		const keysNotInShared = [];
+		for (const [key, entry] of this.index) if (!sharedKeys.has(key)) keysNotInShared.push([key, entry]);
+		const stillExisting = await this.filterExistingFiles(keysNotInShared);
+		for (const [key] of keysNotInShared) {
+			if (stillExisting.has(key)) continue;
+			const entry = this.index.get(key);
+			if (entry) {
+				this.totalSize -= entry.size;
+				this.index.delete(key);
+				this.hashToKey.delete(entry.hash);
+				try {
+					this.onEvict?.(key);
+				} catch {}
+			}
+		}
+	}
+	/**
+	* Verify that a write to the shared index persisted successfully.
+	* Handles concurrent overwrites by checking if our entries are present.
+	* Returns the actual observed version (fixes TOCTOU race condition).
+	*/
+	async verifyWriteSuccess(expectedVersion, localKeys) {
+		const verifyIndex = await this.readSharedIndexWithRetry(2);
+		if (!verifyIndex) return {
+			success: true,
+			actualVersion: expectedVersion
+		};
+		if (verifyIndex.version === expectedVersion) return {
+			success: true,
+			actualVersion: expectedVersion
+		};
+		let allKeysPresent = true;
+		for (const key of localKeys) if (verifyIndex.entries[key] === void 0) {
+			allKeysPresent = false;
+			break;
+		}
+		if (allKeysPresent) return {
+			success: true,
+			actualVersion: verifyIndex.version
+		};
+		return {
+			success: false,
+			actualVersion: verifyIndex.version
+		};
+	}
+	/**
 	* Write the current index to the shared .index.json file.
 	* Merges with existing shared index to preserve entries from other processes.
 	* Uses optimistic concurrency with retry to handle concurrent writers.
 	*/
 	async writeSharedIndex() {
 		const MAX_RETRIES = 3;
+		const snapshot = this.snapshotLocalIndex();
 		for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-			let existingIndex = null;
-			try {
-				const content$1 = await fs.promises.readFile(this.getSharedIndexPath(), "utf8");
-				existingIndex = JSON.parse(content$1);
-			} catch {}
-			const entries = {};
+			const existingIndex = await this.readSharedIndexWithRetry();
+			let foreignEntries = /* @__PURE__ */ new Map();
 			if (existingIndex) {
-				const foreignEntries = Object.entries(existingIndex.entries).filter(([key]) => !this.index.has(key));
-				const verified = await this.filterExistingFiles(foreignEntries);
-				for (const [key, entry] of verified) entries[key] = entry;
+				const foreign = Object.entries(existingIndex.entries).filter(([key]) => !snapshot.keys.has(key));
+				foreignEntries = await this.filterExistingFiles(foreign);
 			}
-			for (const [key, entry] of this.index) entries[key] = {
-				hash: entry.hash,
-				size: entry.size,
-				expiresAt: entry.expiresAt,
-				lastAccessedAt: entry.lastAccessedAt,
-				valueHash: entry.valueHash
-			};
+			const entries = this.buildMergedEntries(snapshot.entries, foreignEntries);
 			const newVersion = (existingIndex?.version ?? 0) + 1;
 			const sharedIndex = {
 				version: newVersion,
@@ -781,30 +890,17 @@ var FileStore = class {
 			};
 			const content = JSON.stringify(sharedIndex);
 			await this.atomicWrite(this.getSharedIndexPath(), Buffer.from(content, "utf8"));
-			try {
-				const verifyContent = await fs.promises.readFile(this.getSharedIndexPath(), "utf8");
-				const verifyIndex = JSON.parse(verifyContent);
-				if (verifyIndex.version === newVersion) {
-					this.indexVersion = newVersion;
-					this.indexDirty = false;
-					return;
-				}
-				if (Array.from(this.index.keys()).every((key) => verifyIndex.entries[key] !== void 0)) {
-					this.indexVersion = verifyIndex.version;
-					this.indexDirty = false;
-					return;
-				}
-				if (attempt < MAX_RETRIES - 1) {
-					const backoffMs = Math.min(10 * Math.pow(2, attempt) + Math.random() * 10, 100);
-					await new Promise((r) => setTimeout(r, backoffMs));
-				}
-			} catch {
-				this.indexVersion = newVersion;
+			const verification = await this.verifyWriteSuccess(newVersion, snapshot.keys);
+			if (verification.success) {
+				this.indexVersion = verification.actualVersion ?? newVersion;
 				this.indexDirty = false;
 				return;
 			}
+			if (attempt < MAX_RETRIES - 1) {
+				const backoffMs = Math.min(10 * Math.pow(2, attempt) + Math.random() * 10, 100);
+				await new Promise((r) => setTimeout(r, backoffMs));
+			}
 		}
-		this.indexDirty = false;
 	}
 	debounceStartTime;
 	/**
@@ -876,8 +972,8 @@ var FileStore = class {
 	*/
 	async mergeSharedIndex() {
 		try {
-			const content = await fs.promises.readFile(this.getSharedIndexPath(), "utf8");
-			const sharedIndex = JSON.parse(content);
+			const sharedIndex = await this.readSharedIndexWithRetry();
+			if (!sharedIndex) return;
 			if (sharedIndex.version <= this.indexVersion) return;
 			const sharedKeys = new Set(Object.keys(sharedIndex.entries));
 			const now = Date.now();
@@ -885,49 +981,9 @@ var FileStore = class {
 			const foreignEntries = nonExpiredEntries.filter(([key]) => !this.index.has(key));
 			const localEntries = nonExpiredEntries.filter(([key]) => this.index.has(key));
 			const verifiedForeignEntries = await this.filterExistingFiles(foreignEntries);
-			const allEntries = new Map([...verifiedForeignEntries, ...localEntries.map(([key, entry]) => [key, entry])]);
-			for (const [key, entry] of allEntries) {
-				const existing = this.index.get(key);
-				if (!existing) {
-					const indexEntry = {
-						hash: entry.hash,
-						size: entry.size,
-						expiresAt: entry.expiresAt,
-						lastAccessedAt: entry.lastAccessedAt,
-						valueHash: entry.valueHash
-					};
-					this.index.set(key, indexEntry);
-					this.hashToKey.set(entry.hash, key);
-					this.totalSize += entry.size;
-				} else {
-					if (entry.valueHash && existing.valueHash !== entry.valueHash) {
-						existing.valueHash = entry.valueHash;
-						try {
-							this.onInvalidate?.(key);
-						} catch {}
-					}
-					this.totalSize -= existing.size;
-					this.totalSize += entry.size;
-					existing.size = entry.size;
-					existing.expiresAt = entry.expiresAt;
-					if (entry.lastAccessedAt > existing.lastAccessedAt) existing.lastAccessedAt = entry.lastAccessedAt;
-				}
-			}
-			const keysNotInShared = [];
-			for (const [key, entry] of this.index) if (!sharedKeys.has(key)) keysNotInShared.push([key, entry]);
-			const stillExisting = await this.filterExistingFiles(keysNotInShared);
-			const keysToRemove = keysNotInShared.filter(([key]) => !stillExisting.has(key)).map(([key]) => key);
-			for (const key of keysToRemove) {
-				const entry = this.index.get(key);
-				if (entry) {
-					this.totalSize -= entry.size;
-					this.index.delete(key);
-					this.hashToKey.delete(entry.hash);
-					try {
-						this.onEvict?.(key);
-					} catch {}
-				}
-			}
+			for (const [key, entry] of verifiedForeignEntries) this.addForeignEntry(key, entry);
+			for (const [key, entry] of localEntries) this.updateLocalEntryFromShared(key, entry);
+			await this.removeDeletedKeys(sharedKeys);
 			this.indexVersion = sharedIndex.version;
 		} catch {}
 	}

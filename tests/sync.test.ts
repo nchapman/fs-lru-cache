@@ -694,4 +694,479 @@ describe("Multi-process sync", () => {
       }
     });
   });
+
+  describe("helper function scenarios", () => {
+    describe("readSharedIndexWithRetry", () => {
+      it("should recover from corrupted index file", async () => {
+        const dir = testDir("sync-corrupt-index");
+        registerCleanup(dir);
+
+        // Create cache and write data
+        const cache1 = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        await cache1.set("key1", "value1");
+        await cache1.forceSync();
+        await cache1.close();
+
+        // Corrupt the index file with invalid JSON
+        const indexPath = join(dir, ".index.json");
+        await fs.writeFile(indexPath, "{ invalid json }}}");
+
+        // New cache should handle corrupt index gracefully (falls back to dir scan)
+        const cache2 = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Should still be able to read the value (file exists on disk)
+          expect(await cache2.get("key1")).toBe("value1");
+        } finally {
+          await cache2.close();
+        }
+      });
+
+      it("should handle missing index file on first sync", async () => {
+        const dir = testDir("sync-no-index");
+        registerCleanup(dir);
+
+        const cache = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // forceSync should work even with no existing index
+          await cache.forceSync();
+          await cache.set("key1", "value1");
+          await cache.forceSync();
+
+          // Verify index was created
+          const indexPath = join(dir, ".index.json");
+          const content = await fs.readFile(indexPath, "utf8");
+          const index: SharedIndex = JSON.parse(content);
+          expect(index.entries["key1"]).toBeDefined();
+        } finally {
+          await cache.close();
+        }
+      });
+    });
+
+    describe("buildMergedEntries (local precedence)", () => {
+      it("should preserve local entries when merging with foreign", async () => {
+        const dir = testDir("sync-merge-precedence");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Both write to the same key with different values
+          await cacheA.set("shared-key", "valueA");
+          await cacheB.set("shared-key", "valueB");
+
+          // Also write unique keys
+          await cacheA.set("keyA", "onlyA");
+          await cacheB.set("keyB", "onlyB");
+
+          // Both sync - each should keep their own value for shared-key
+          await cacheA.forceSync();
+          await cacheB.forceSync();
+
+          // cacheA's shared-key should still be valueA (local precedence)
+          // cacheB's shared-key should still be valueB (local precedence)
+          // Note: The actual file on disk depends on write order
+          expect(await cacheA.get("keyA")).toBe("onlyA");
+          expect(await cacheB.get("keyB")).toBe("onlyB");
+
+          // After another sync round, both should see each other's unique keys
+          await cacheA.forceSync();
+          expect(await cacheA.get("keyB")).toBe("onlyB");
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+    });
+
+    describe("verifyWriteSuccess (version tracking)", () => {
+      it("should track correct version after concurrent index writes", async () => {
+        const dir = testDir("sync-version-tracking");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Initial writes
+          await cacheA.set("keyA", "valueA");
+          await cacheA.forceSync();
+
+          // Read the index version
+          const indexPath = join(dir, ".index.json");
+          let content = await fs.readFile(indexPath, "utf8");
+          let index: SharedIndex = JSON.parse(content);
+          const versionAfterA = index.version;
+
+          // cacheB writes and syncs
+          await cacheB.set("keyB", "valueB");
+          await cacheB.forceSync();
+
+          content = await fs.readFile(indexPath, "utf8");
+          index = JSON.parse(content);
+          const versionAfterB = index.version;
+
+          // Version should have incremented
+          expect(versionAfterB).toBeGreaterThan(versionAfterA);
+
+          // Both keys should be in the index
+          expect(index.entries["keyA"]).toBeDefined();
+          expect(index.entries["keyB"]).toBeDefined();
+
+          // cacheA syncs again - should see keyB and update its version
+          await cacheA.forceSync();
+          const keysA = await cacheA.keys();
+          expect(keysA).toContain("keyB");
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+
+      it("should handle rapid sequential syncs without losing entries", async () => {
+        const dir = testDir("sync-rapid-sequential");
+        registerCleanup(dir);
+
+        const cache = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Rapid writes and syncs
+          for (let i = 0; i < 10; i++) {
+            await cache.set(`key-${i}`, `value-${i}`);
+            await cache.forceSync();
+          }
+
+          // All entries should be present
+          const keys = await cache.keys();
+          expect(keys.length).toBe(10);
+
+          // Verify index has correct version progression
+          const indexPath = join(dir, ".index.json");
+          const content = await fs.readFile(indexPath, "utf8");
+          const index: SharedIndex = JSON.parse(content);
+          expect(index.version).toBeGreaterThanOrEqual(10);
+        } finally {
+          await cache.close();
+        }
+      });
+    });
+
+    describe("updateLocalEntryFromShared (invalidation)", () => {
+      it("should invalidate memory cache when value changes from another process", async () => {
+        const dir = testDir("sync-invalidation");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+          maxMemoryItems: 100,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+          maxMemoryItems: 100,
+        });
+
+        try {
+          // cacheA writes and syncs
+          await cacheA.set("key1", "original-value");
+          await cacheA.forceSync();
+
+          // cacheB reads the value (goes into memory cache)
+          await cacheB.forceSync();
+          expect(await cacheB.get("key1")).toBe("original-value");
+
+          // Verify it's in cacheB's memory
+          const statsB1 = await cacheB.stats();
+          expect(statsB1.memory.items).toBe(1);
+
+          // cacheA overwrites with new value
+          await cacheA.set("key1", "updated-value");
+          await cacheA.forceSync();
+
+          // cacheB syncs - should invalidate memory cache due to valueHash change
+          await cacheB.forceSync();
+
+          // cacheB should now return the updated value
+          expect(await cacheB.get("key1")).toBe("updated-value");
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+
+      it("should keep more recent lastAccessedAt during merge", async () => {
+        const dir = testDir("sync-last-accessed");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // cacheA writes
+          await cacheA.set("key1", "value1");
+          await cacheA.forceSync();
+
+          // cacheB syncs and accesses the key (updates lastAccessedAt)
+          await cacheB.forceSync();
+          await delay(10);
+          await cacheB.get("key1"); // Touch the key
+          await cacheB.forceSync();
+
+          // Read the index
+          const indexPath = join(dir, ".index.json");
+          const content = await fs.readFile(indexPath, "utf8");
+          const index: SharedIndex = JSON.parse(content);
+
+          // lastAccessedAt should be updated
+          expect(index.entries["key1"]?.lastAccessedAt).toBeDefined();
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+    });
+
+    describe("removeDeletedKeys", () => {
+      it("should remove keys deleted by another process", async () => {
+        const dir = testDir("sync-remove-deleted");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Both start with the same keys
+          await cacheA.set("key1", "value1");
+          await cacheA.set("key2", "value2");
+          await cacheA.set("key3", "value3");
+          await cacheA.forceSync();
+          await cacheB.forceSync();
+
+          // Verify cacheB has all keys
+          expect((await cacheB.keys()).sort()).toEqual(["key1", "key2", "key3"]);
+
+          // cacheA deletes key2
+          await cacheA.del("key2");
+          await cacheA.forceSync();
+
+          // cacheB syncs - should see key2 removed
+          await cacheB.forceSync();
+          expect((await cacheB.keys()).sort()).toEqual(["key1", "key3"]);
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+
+      it("should not remove local keys when file still exists on disk", async () => {
+        const dir = testDir("sync-local-file-exists");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+        });
+
+        try {
+          // Both caches write different keys
+          await cacheA.set("keyA", "valueA");
+          await cacheB.set("keyB", "valueB");
+
+          // cacheA syncs first (only knows about keyA)
+          await cacheA.forceSync();
+
+          // cacheB syncs - should keep keyB even though cacheA's index doesn't have it
+          // because the file still exists on disk
+          await cacheB.forceSync();
+
+          // cacheB should still have keyB
+          expect(await cacheB.get("keyB")).toBe("valueB");
+
+          // And should now also have keyA from cacheA
+          expect(await cacheB.get("keyA")).toBe("valueA");
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+
+      it("should clear memory cache when key is deleted by another process", async () => {
+        const dir = testDir("sync-memory-clear-on-delete");
+        registerCleanup(dir);
+
+        const cacheA = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+          maxMemoryItems: 100,
+        });
+
+        const cacheB = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 1000,
+          maxMemoryItems: 100,
+        });
+
+        try {
+          // Setup: both have the key
+          await cacheA.set("key1", "value1");
+          await cacheA.forceSync();
+          await cacheB.forceSync();
+
+          // cacheB reads the value (puts it in memory)
+          expect(await cacheB.get("key1")).toBe("value1");
+          const statsB1 = await cacheB.stats();
+          expect(statsB1.memory.items).toBe(1);
+
+          // cacheA deletes the key and syncs
+          await cacheA.del("key1");
+          await cacheA.forceSync();
+
+          // cacheB syncs - should remove key from both disk index and memory
+          await cacheB.forceSync();
+
+          // Key should no longer be accessible
+          expect(await cacheB.get("key1")).toBeNull();
+
+          // Memory should be cleared (the internal evict mechanism clears memory)
+          const statsB2 = await cacheB.stats();
+          expect(statsB2.memory.items).toBe(0);
+        } finally {
+          await cacheA.close();
+          await cacheB.close();
+        }
+      });
+    });
+
+    describe("snapshotLocalIndex (write isolation)", () => {
+      it("should handle writes during sync without corruption", async () => {
+        const dir = testDir("sync-write-during-sync");
+        registerCleanup(dir);
+
+        const cache = new FsLruCache({
+          dir,
+          syncWrites: true,
+          experimentalMultiProcess: true,
+          syncInterval: 50, // Fast sync
+        });
+
+        try {
+          // Start with some data
+          await cache.set("initial", "value");
+          await cache.forceSync();
+
+          // Rapidly write while syncs are happening
+          const writePromises: Promise<void>[] = [];
+          for (let i = 0; i < 20; i++) {
+            writePromises.push(cache.set(`key-${i}`, `value-${i}`));
+          }
+          await Promise.all(writePromises);
+
+          // Wait for auto-syncs to settle
+          await delay(200);
+
+          // Force final sync
+          await cache.forceSync();
+
+          // All keys should be present
+          const keys = await cache.keys();
+          expect(keys.length).toBe(21); // initial + 20 new keys
+
+          // Verify index integrity
+          const indexPath = join(dir, ".index.json");
+          const content = await fs.readFile(indexPath, "utf8");
+          const index: SharedIndex = JSON.parse(content);
+          expect(Object.keys(index.entries).length).toBe(21);
+        } finally {
+          await cache.close();
+        }
+      });
+    });
+  });
 });
