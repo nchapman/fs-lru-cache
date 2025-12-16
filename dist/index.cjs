@@ -264,6 +264,7 @@ var FileStore = class {
 	experimentalMultiProcess;
 	syncInterval;
 	onBeforeSync;
+	onError;
 	initialized = false;
 	index = /* @__PURE__ */ new Map();
 	hashToKey = /* @__PURE__ */ new Map();
@@ -284,6 +285,22 @@ var FileStore = class {
 		this.experimentalMultiProcess = options.experimentalMultiProcess ?? false;
 		this.syncInterval = options.syncInterval ?? 1e3;
 		this.onBeforeSync = options.onBeforeSync;
+		this.onError = options.onError;
+	}
+	/**
+	* Emit an error event through the onError callback.
+	*/
+	emitError(type, error, operation, message, key) {
+		if (!this.onError) return;
+		try {
+			this.onError({
+				type,
+				error: error instanceof Error ? error : new Error(String(error)),
+				operation,
+				message,
+				key
+			});
+		} catch {}
 	}
 	/**
 	* Check if a buffer is gzip compressed by looking for magic bytes.
@@ -316,7 +333,9 @@ var FileStore = class {
 		if (!await this.loadSharedIndex()) await this.loadIndex();
 		if (this.experimentalMultiProcess) {
 			this.syncTimer = setInterval(() => {
-				this.sync().catch(() => {});
+				this.sync().catch((err) => {
+					this.emitError("sync_error", err, "sync", "Periodic index sync failed");
+				});
 			}, this.syncInterval);
 			this.syncTimer.unref();
 		}
@@ -366,7 +385,10 @@ var FileStore = class {
 			});
 			this.hashToKey.set(hash, data.key);
 			this.totalSize += stat.size;
-		} catch {}
+		} catch (err) {
+			const isSyntaxError = err instanceof SyntaxError;
+			this.emitError(isSyntaxError ? "parse_error" : "read_error", err, "init", `Failed to load cache file: ${filePath}`);
+		}
 	}
 	/**
 	* Get the file path for a hash
@@ -420,10 +442,14 @@ var FileStore = class {
 				return null;
 			}
 			return entry;
-		} catch {
+		} catch (err) {
 			this.totalSize -= indexEntry.size;
 			this.index.delete(key);
 			this.hashToKey.delete(indexEntry.hash);
+			if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) {
+				const isSyntaxError = err instanceof SyntaxError;
+				this.emitError(isSyntaxError ? "parse_error" : "read_error", err, "get", `Failed to read cache file for key`, key);
+			}
 			return null;
 		}
 	}
@@ -555,7 +581,8 @@ var FileStore = class {
 			if (this.experimentalMultiProcess) indexEntry.valueHash = hashValue(serialized);
 			this.markIndexDirty();
 			return true;
-		} catch {
+		} catch (err) {
+			this.emitError("write_error", err, "expire", "Failed to update expiry", key);
 			return false;
 		}
 	}
@@ -585,7 +612,9 @@ var FileStore = class {
 		try {
 			const nowDate = new Date(now);
 			await fs.promises.utimes(filePath, nowDate, nowDate);
-		} catch {}
+		} catch (err) {
+			if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) this.emitError("write_error", err, "touch", "Failed to update file timestamp", key);
+		}
 		return true;
 	}
 	/**
@@ -939,7 +968,9 @@ var FileStore = class {
 		try {
 			await this.onBeforeSync?.();
 			await this.writeSharedIndex();
-		} catch {}
+		} catch (err) {
+			this.emitError("sync_error", err, "sync", "Failed to write shared index");
+		}
 	}
 	/**
 	* Sync with the shared index file.
@@ -985,7 +1016,9 @@ var FileStore = class {
 			for (const [key, entry] of localEntries) this.updateLocalEntryFromShared(key, entry);
 			await this.removeDeletedKeys(sharedKeys);
 			this.indexVersion = sharedIndex.version;
-		} catch {}
+		} catch (err) {
+			this.emitError("sync_error", err, "sync", "Failed to merge shared index");
+		}
 	}
 	/**
 	* Mark the index as dirty, scheduling a write if sync is enabled.
@@ -1034,9 +1067,17 @@ var FsLruCache = class {
 	defaultTtl;
 	namespace;
 	syncWrites;
+	onError;
 	hits = 0;
 	misses = 0;
 	closed = false;
+	errorStats = {
+		readErrors: 0,
+		parseErrors: 0,
+		writeErrors: 0,
+		syncErrors: 0,
+		integrityErrors: 0
+	};
 	inFlight = /* @__PURE__ */ new Map();
 	/**
 	* Pending async disk writes per key.
@@ -1058,6 +1099,7 @@ var FsLruCache = class {
 		this.defaultTtl = opts.defaultTtl;
 		this.namespace = opts.namespace;
 		this.syncWrites = opts.syncWrites;
+		this.onError = opts.onError;
 		this.memory = new MemoryStore({
 			maxItems: opts.maxMemoryItems,
 			maxSize: opts.maxMemorySize
@@ -1076,7 +1118,8 @@ var FsLruCache = class {
 			onInvalidate: (key) => {
 				this.memory.delete(key);
 			},
-			onBeforeSync: () => this.flushPendingWrites()
+			onBeforeSync: () => this.flushPendingWrites(),
+			onError: (err) => this.handleError(err)
 		});
 		if (opts.pruneInterval && opts.pruneInterval > 0) {
 			this.pruneTimer = setInterval(() => {
@@ -1111,6 +1154,31 @@ var FsLruCache = class {
 	}
 	assertOpen() {
 		if (this.closed) throw new Error("Cache is closed");
+	}
+	/**
+	* Handle an error event: increment counters and forward to user callback.
+	*/
+	handleError(err) {
+		switch (err.type) {
+			case "read_error":
+				this.errorStats.readErrors++;
+				break;
+			case "parse_error":
+				this.errorStats.parseErrors++;
+				break;
+			case "write_error":
+				this.errorStats.writeErrors++;
+				break;
+			case "sync_error":
+				this.errorStats.syncErrors++;
+				break;
+			case "integrity_error":
+				this.errorStats.integrityErrors++;
+				break;
+		}
+		try {
+			this.onError?.(err);
+		} catch {}
 	}
 	/**
 	* Schedule a debounced touch for the file store.
@@ -1229,8 +1297,15 @@ var FsLruCache = class {
 				serialized: valueSerialized,
 				expiresAt,
 				size: valueSize,
-				promise: (this.pendingWrites.get(prefixedKey)?.promise ?? Promise.resolve()).then(() => this.files.set(prefixedKey, value, expiresAt, entrySerialized)).catch(() => {
+				promise: (this.pendingWrites.get(prefixedKey)?.promise ?? Promise.resolve()).then(() => this.files.set(prefixedKey, value, expiresAt, entrySerialized)).catch((err) => {
 					this.memory.delete(prefixedKey);
+					this.handleError({
+						type: "write_error",
+						error: err instanceof Error ? err : new Error(String(err)),
+						operation: "set",
+						message: "Async disk write failed",
+						key: this.unprefixKey(prefixedKey)
+					});
 				}).then(() => {
 					if (this.pendingWrites.get(prefixedKey) === pendingWrite) this.pendingWrites.delete(prefixedKey);
 				})
@@ -1381,8 +1456,15 @@ var FsLruCache = class {
 				serialized: p.valueSerialized,
 				expiresAt: p.expiresAt,
 				size: p.valueSize,
-				promise: diskWrite.catch(() => {
+				promise: diskWrite.catch((err) => {
 					this.memory.delete(p.prefixedKey);
+					this.handleError({
+						type: "write_error",
+						error: err instanceof Error ? err : new Error(String(err)),
+						operation: "set",
+						message: "Async disk write failed (mset)",
+						key: this.unprefixKey(p.prefixedKey)
+					});
 				}).then(() => {
 					if (this.pendingWrites.get(p.prefixedKey) === pendingWrite) this.pendingWrites.delete(p.prefixedKey);
 				})
@@ -1458,15 +1540,23 @@ var FsLruCache = class {
 				items: diskItemCount,
 				size: diskSize
 			},
-			pendingWrites: this.pendingWrites.size
+			pendingWrites: this.pendingWrites.size,
+			errors: { ...this.errorStats }
 		};
 	}
 	/**
-	* Reset hit/miss counters.
+	* Reset hit/miss counters and error stats.
 	*/
 	resetStats() {
 		this.hits = 0;
 		this.misses = 0;
+		this.errorStats = {
+			readErrors: 0,
+			parseErrors: 0,
+			writeErrors: 0,
+			syncErrors: 0,
+			integrityErrors: 0
+		};
 	}
 	/**
 	* Wait for all pending async writes and touches to complete.

@@ -3,7 +3,14 @@ import { join } from "path";
 import { randomBytes } from "crypto";
 import { gzip, gunzip } from "zlib";
 import { promisify } from "util";
-import { CacheEntry, SharedIndex, SharedIndexEntry } from "./types.js";
+import {
+  CacheEntry,
+  SharedIndex,
+  SharedIndexEntry,
+  CacheError,
+  CacheErrorType,
+  ErrorCallback,
+} from "./types.js";
 
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
@@ -55,6 +62,11 @@ export interface FileStoreOptions {
    * Should flush any pending async writes to ensure index consistency.
    */
   onBeforeSync?: () => Promise<void>;
+  /**
+   * Called when recoverable errors occur during file operations.
+   * Useful for logging, monitoring, and alerting.
+   */
+  onError?: ErrorCallback;
 }
 
 interface IndexEntry {
@@ -79,6 +91,7 @@ export class FileStore {
   private readonly experimentalMultiProcess: boolean;
   private readonly syncInterval: number;
   private readonly onBeforeSync?: () => Promise<void>;
+  private readonly onError?: ErrorCallback;
   private initialized = false;
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
@@ -105,6 +118,31 @@ export class FileStore {
     this.experimentalMultiProcess = options.experimentalMultiProcess ?? false;
     this.syncInterval = options.syncInterval ?? 1000;
     this.onBeforeSync = options.onBeforeSync;
+    this.onError = options.onError;
+  }
+
+  /**
+   * Emit an error event through the onError callback.
+   */
+  private emitError(
+    type: CacheErrorType,
+    error: unknown,
+    operation: CacheError["operation"],
+    message: string,
+    key?: string,
+  ): void {
+    if (!this.onError) return;
+    try {
+      this.onError({
+        type,
+        error: error instanceof Error ? error : new Error(String(error)),
+        operation,
+        message,
+        key,
+      });
+    } catch {
+      // Don't let callback errors propagate
+    }
   }
 
   /**
@@ -156,7 +194,9 @@ export class FileStore {
     // Start sync timer if experimental multi-process mode is enabled
     if (this.experimentalMultiProcess) {
       this.syncTimer = setInterval(() => {
-        this.sync().catch(() => {});
+        this.sync().catch((err) => {
+          this.emitError("sync_error", err, "sync", "Periodic index sync failed");
+        });
       }, this.syncInterval);
       this.syncTimer.unref();
     }
@@ -216,8 +256,15 @@ export class FileStore {
       });
       this.hashToKey.set(hash, data.key);
       this.totalSize += stat.size;
-    } catch {
-      // Skip invalid files
+    } catch (err) {
+      // Emit error for corrupted/invalid files
+      const isSyntaxError = err instanceof SyntaxError;
+      this.emitError(
+        isSyntaxError ? "parse_error" : "read_error",
+        err,
+        "init",
+        `Failed to load cache file: ${filePath}`,
+      );
     }
   }
 
@@ -284,11 +331,24 @@ export class FileStore {
         return null;
       }
       return entry;
-    } catch {
+    } catch (err) {
       // File missing or corrupted - clean up index
       this.totalSize -= indexEntry.size;
       this.index.delete(key);
       this.hashToKey.delete(indexEntry.hash);
+
+      // Emit error (but not for ENOENT - that's expected for deleted files)
+      const isNotFound = err instanceof Error && "code" in err && err.code === "ENOENT";
+      if (!isNotFound) {
+        const isSyntaxError = err instanceof SyntaxError;
+        this.emitError(
+          isSyntaxError ? "parse_error" : "read_error",
+          err,
+          "get",
+          `Failed to read cache file for key`,
+          key,
+        );
+      }
       return null;
     }
   }
@@ -472,7 +532,8 @@ export class FileStore {
       this.markIndexDirty();
 
       return true;
-    } catch {
+    } catch (err) {
+      this.emitError("write_error", err, "expire", "Failed to update expiry", key);
       return false;
     }
   }
@@ -509,8 +570,12 @@ export class FileStore {
     try {
       const nowDate = new Date(now);
       await fs.utimes(filePath, nowDate, nowDate);
-    } catch {
-      // File may be gone, but index update still valid for this session
+    } catch (err) {
+      // File may be gone (ENOENT is expected), but other errors should be reported
+      const isNotFound = err instanceof Error && "code" in err && err.code === "ENOENT";
+      if (!isNotFound) {
+        this.emitError("write_error", err, "touch", "Failed to update file timestamp", key);
+      }
     }
 
     return true;
@@ -1036,8 +1101,9 @@ export class FileStore {
       // Flush pending writes first to ensure index reflects disk state
       await this.onBeforeSync?.();
       await this.writeSharedIndex();
-    } catch {
-      // Index write failures are non-fatal
+    } catch (err) {
+      // Index write failures are non-fatal but should be reported
+      this.emitError("sync_error", err, "sync", "Failed to write shared index");
     }
   }
 
@@ -1123,8 +1189,9 @@ export class FileStore {
       await this.removeDeletedKeys(sharedKeys);
 
       this.indexVersion = sharedIndex.version;
-    } catch {
+    } catch (err) {
       // Merge failures are non-fatal - we'll try again on next sync
+      this.emitError("sync_error", err, "sync", "Failed to merge shared index");
     }
   }
 

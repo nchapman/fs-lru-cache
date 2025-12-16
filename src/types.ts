@@ -46,6 +46,22 @@ export interface CacheOptions {
    * Only used when experimentalMultiProcess is true.
    */
   syncInterval?: number;
+  /**
+   * Callback for error events.
+   * Called when recoverable errors occur during cache operations.
+   * Useful for logging, monitoring, and alerting on potential problems.
+   *
+   * @example
+   * ```ts
+   * const cache = new FsLruCache({
+   *   onError: (err) => {
+   *     console.error(`Cache ${err.type}: ${err.message}`, err.error);
+   *     metrics.increment(`cache.errors.${err.type}`);
+   *   }
+   * });
+   * ```
+   */
+  onError?: ErrorCallback;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -66,6 +82,22 @@ export interface MemoryEntry {
   expiresAt: number | null;
   /** Size in bytes */
   size: number;
+}
+
+/**
+ * Error counters by type.
+ */
+export interface ErrorStats {
+  /** File read failures */
+  readErrors: number;
+  /** JSON parse failures */
+  parseErrors: number;
+  /** File write failures */
+  writeErrors: number;
+  /** Index sync failures (multi-process mode) */
+  syncErrors: number;
+  /** Value integrity failures */
+  integrityErrors: number;
 }
 
 export interface CacheStats {
@@ -89,6 +121,8 @@ export interface CacheStats {
   };
   /** Number of pending async disk writes */
   pendingWrites: number;
+  /** Error counters by type */
+  errors: ErrorStats;
 }
 
 /**
@@ -106,6 +140,46 @@ export interface PendingWrite {
   /** Promise that resolves when this write (and all prior writes) complete */
   promise: Promise<void>;
 }
+
+/**
+ * Error categories for cache operations.
+ * Used with the onError callback to classify error types.
+ */
+export type CacheErrorType =
+  /** File read failed (I/O error, permission denied, etc.) */
+  | "read_error"
+  /** JSON parse failed (corrupted data, partial write, etc.) */
+  | "parse_error"
+  /** File write failed (disk full, permission denied, etc.) */
+  | "write_error"
+  /** Index sync failed in multi-process mode */
+  | "sync_error"
+  /** Value hash mismatch (potential data corruption) */
+  | "integrity_error";
+
+/**
+ * Error event emitted by the cache.
+ * Contains the error type, original error, and context about the operation.
+ */
+export interface CacheError {
+  /** Category of error */
+  type: CacheErrorType;
+  /** The underlying error */
+  error: Error;
+  /** Cache key involved (if applicable) */
+  key?: string;
+  /** Operation that failed */
+  operation: "get" | "set" | "delete" | "sync" | "prune" | "init" | "touch" | "expire";
+  /** Additional context */
+  message: string;
+}
+
+/**
+ * Callback for error events.
+ * Called when recoverable errors occur during cache operations.
+ * The cache will continue operating after these errors.
+ */
+export type ErrorCallback = (error: CacheError) => void;
 
 export const DEFAULT_OPTIONS = {
   dir: ".cache",
