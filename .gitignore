@@ -2,6 +2,7 @@ node_modules/
 .cache/
 .test-cache-*/
 .bench-cache/
+.stress-test-cache/
 *.log
 .DS_Store
 coverage/

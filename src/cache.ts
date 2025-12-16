@@ -1,4 +1,12 @@
-import { CacheOptions, CacheStats, PendingWrite, DEFAULT_OPTIONS } from "./types.js";
+import {
+  CacheOptions,
+  CacheStats,
+  PendingWrite,
+  DEFAULT_OPTIONS,
+  ErrorStats,
+  CacheError,
+  ErrorCallback,
+} from "./types.js";
 import { MemoryStore } from "./memory-store.js";
 import { FileStore } from "./file-store.js";
 import { isExpired, compilePattern, matchPattern, CompiledPattern } from "./utils.js";
@@ -21,9 +29,19 @@ export class FsLruCache {
   private readonly defaultTtl?: number;
   private readonly namespace?: string;
   private readonly syncWrites: boolean;
+  private readonly onError?: ErrorCallback;
   private hits = 0;
   private misses = 0;
   private closed = false;
+
+  // Error counters
+  private errorStats: ErrorStats = {
+    readErrors: 0,
+    parseErrors: 0,
+    writeErrors: 0,
+    syncErrors: 0,
+    integrityErrors: 0,
+  };
 
   // In-flight operations for stampede protection
   private inFlight = new Map<string, Promise<unknown>>();
@@ -50,6 +68,7 @@ export class FsLruCache {
     this.defaultTtl = opts.defaultTtl;
     this.namespace = opts.namespace;
     this.syncWrites = opts.syncWrites;
+    this.onError = opts.onError;
 
     this.memory = new MemoryStore({
       maxItems: opts.maxMemoryItems,
@@ -61,12 +80,23 @@ export class FsLruCache {
       shards: opts.shards,
       maxSize: opts.maxDiskSize,
       gzip: opts.gzip,
+      experimentalMultiProcess: opts.experimentalMultiProcess,
+      syncInterval: opts.syncInterval,
       // Keep memory in sync: when disk evicts a key, remove from memory too.
       // This ensures memory is always a subset of disk (source of truth).
       onEvict: (key) => {
         this.memory.delete(key);
         this.cancelDebouncedTouch(key);
       },
+      // Invalidate memory cache when another process overwrites a value.
+      // The key still exists on disk, so only clear the stale memory entry.
+      onInvalidate: (key) => {
+        this.memory.delete(key);
+      },
+      // Called before index sync operations to ensure pending writes are on disk
+      onBeforeSync: () => this.flushPendingWrites(),
+      // Track errors and forward to user callback
+      onError: (err) => this.handleError(err),
     });
 
     // Start background pruning if configured
@@ -113,6 +143,37 @@ export class FsLruCache {
   private assertOpen(): void {
     if (this.closed) {
       throw new Error("Cache is closed");
+    }
+  }
+
+  /**
+   * Handle an error event: increment counters and forward to user callback.
+   */
+  private handleError(err: CacheError): void {
+    // Increment the appropriate counter
+    switch (err.type) {
+      case "read_error":
+        this.errorStats.readErrors++;
+        break;
+      case "parse_error":
+        this.errorStats.parseErrors++;
+        break;
+      case "write_error":
+        this.errorStats.writeErrors++;
+        break;
+      case "sync_error":
+        this.errorStats.syncErrors++;
+        break;
+      case "integrity_error":
+        this.errorStats.integrityErrors++;
+        break;
+    }
+
+    // Forward to user callback if provided
+    try {
+      this.onError?.(err);
+    } catch {
+      // Don't let callback errors propagate
     }
   }
 
@@ -303,9 +364,17 @@ export class FsLruCache {
         expiresAt,
         size: valueSize,
         promise: diskWrite
-          .catch(() => {
+          .catch((err) => {
             // Evict from memory if disk write fails
             this.memory.delete(prefixedKey);
+            // Emit write error
+            this.handleError({
+              type: "write_error",
+              error: err instanceof Error ? err : new Error(String(err)),
+              operation: "set",
+              message: "Async disk write failed",
+              key: this.unprefixKey(prefixedKey),
+            });
           })
           .then(() => {
             // Only delete if this is still the current pending write for this key
@@ -564,9 +633,17 @@ export class FsLruCache {
           expiresAt: p.expiresAt,
           size: p.valueSize,
           promise: diskWrite
-            .catch(() => {
+            .catch((err) => {
               // Evict only this key from memory if its write fails
               this.memory.delete(p.prefixedKey);
+              // Emit write error
+              this.handleError({
+                type: "write_error",
+                error: err instanceof Error ? err : new Error(String(err)),
+                operation: "set",
+                message: "Async disk write failed (mset)",
+                key: this.unprefixKey(p.prefixedKey),
+              });
             })
             .then(() => {
               // Only delete if this is still the current pending write for this key
@@ -679,15 +756,23 @@ export class FsLruCache {
         size: diskSize,
       },
       pendingWrites: this.pendingWrites.size,
+      errors: { ...this.errorStats },
     };
   }
 
   /**
-   * Reset hit/miss counters.
+   * Reset hit/miss counters and error stats.
    */
   resetStats(): void {
     this.hits = 0;
     this.misses = 0;
+    this.errorStats = {
+      readErrors: 0,
+      parseErrors: 0,
+      writeErrors: 0,
+      syncErrors: 0,
+      integrityErrors: 0,
+    };
   }
 
   /**
@@ -705,6 +790,28 @@ export class FsLruCache {
     // Wait for all pending writes and touches
     const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
     await Promise.all([...pendingWritePromises, ...this.pendingTouches]);
+  }
+
+  /**
+   * Flush pending disk writes only (without touches).
+   * Used internally before index sync operations.
+   */
+  private async flushPendingWrites(): Promise<void> {
+    const pendingWritePromises = [...this.pendingWrites.values()].map((pw) => pw.promise);
+    await Promise.all(pendingWritePromises);
+  }
+
+  /**
+   * Force immediate synchronization with the shared index file.
+   * This flushes all pending writes, writes the local index, and reads
+   * any changes from other processes sharing the same cache directory.
+   *
+   * Only useful when syncInterval > 0 (multi-process mode).
+   * Call this before critical reads that need the freshest data from other processes.
+   */
+  async forceSync(): Promise<void> {
+    this.assertOpen();
+    await this.files.sync();
   }
 
   /**
@@ -744,6 +851,9 @@ export class FsLruCache {
    * After closing, all operations will throw.
    */
   async close(): Promise<void> {
+    // Mark as closed immediately to prevent new operations from starting
+    this.closed = true;
+
     // Wait for all pending async writes and touches to complete
     await this.flush();
 
@@ -751,7 +861,10 @@ export class FsLruCache {
       clearInterval(this.pruneTimer);
       this.pruneTimer = undefined;
     }
-    this.closed = true;
+
+    // Close file store (stops sync timer, flushes index)
+    await this.files.close();
+
     this.inFlight.clear();
   }
 }

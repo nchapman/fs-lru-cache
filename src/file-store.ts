@@ -3,12 +3,20 @@ import { join } from "path";
 import { randomBytes } from "crypto";
 import { gzip, gunzip } from "zlib";
 import { promisify } from "util";
-import { CacheEntry } from "./types.js";
+import {
+  CacheEntry,
+  SharedIndex,
+  SharedIndexEntry,
+  CacheError,
+  CacheErrorType,
+  ErrorCallback,
+} from "./types.js";
 
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
 import {
   hashKey,
+  hashValue,
   getShardIndex,
   getShardName,
   isExpired,
@@ -25,14 +33,40 @@ export interface FileStoreOptions {
   maxSize: number;
   gzip?: boolean;
   /**
-   * Called synchronously when a key is evicted due to:
+   * Called synchronously when a key is evicted from disk due to:
    * - Hash collision (another key claims the same hash)
    * - Space pressure (LRU eviction to stay under maxSize)
+   * - Deleted by another process (detected during sync)
    *
    * NOT called for explicit delete() operations.
    * This allows the parent to keep other caches in sync.
    */
   onEvict?: (key: string) => void;
+  /**
+   * Called when a key's value was changed by another process.
+   * The file still exists but contains different data.
+   * Use this to invalidate memory caches holding stale values.
+   */
+  onInvalidate?: (key: string) => void;
+  /**
+   * Enable experimental multi-process mode for sharing cache across processes.
+   */
+  experimentalMultiProcess?: boolean;
+  /**
+   * Interval in ms to sync index with other processes (default: 1000).
+   * Only used when experimentalMultiProcess is true.
+   */
+  syncInterval?: number;
+  /**
+   * Called before writing or reading the shared index.
+   * Should flush any pending async writes to ensure index consistency.
+   */
+  onBeforeSync?: () => Promise<void>;
+  /**
+   * Called when recoverable errors occur during file operations.
+   * Useful for logging, monitoring, and alerting.
+   */
+  onError?: ErrorCallback;
 }
 
 interface IndexEntry {
@@ -40,6 +74,8 @@ interface IndexEntry {
   expiresAt: number | null;
   lastAccessedAt: number;
   size: number;
+  /** Hash of the value content (to detect overwrites by other processes) */
+  valueHash?: string;
 }
 
 /**
@@ -51,6 +87,11 @@ export class FileStore {
   private readonly maxSize: number;
   private readonly gzip: boolean;
   private readonly onEvict?: (key: string) => void;
+  private readonly onInvalidate?: (key: string) => void;
+  private readonly experimentalMultiProcess: boolean;
+  private readonly syncInterval: number;
+  private readonly onBeforeSync?: () => Promise<void>;
+  private readonly onError?: ErrorCallback;
   private initialized = false;
 
   // In-memory index: key -> metadata (no values, just for fast lookups)
@@ -59,12 +100,49 @@ export class FileStore {
   private hashToKey = new Map<string, string>();
   private totalSize = 0;
 
+  // Multi-process sync state
+  private indexVersion = 0;
+  private indexDirty = false;
+  private syncTimer?: ReturnType<typeof setInterval>;
+  private indexWriteTimer?: ReturnType<typeof setTimeout>;
+  private pendingIndexWrite?: Promise<void>;
+  private syncInProgress?: Promise<void>;
+
   constructor(options: FileStoreOptions) {
     this.dir = options.dir;
     this.shards = options.shards;
     this.maxSize = options.maxSize;
     this.gzip = options.gzip ?? false;
     this.onEvict = options.onEvict;
+    this.onInvalidate = options.onInvalidate;
+    this.experimentalMultiProcess = options.experimentalMultiProcess ?? false;
+    this.syncInterval = options.syncInterval ?? 1000;
+    this.onBeforeSync = options.onBeforeSync;
+    this.onError = options.onError;
+  }
+
+  /**
+   * Emit an error event through the onError callback.
+   */
+  private emitError(
+    type: CacheErrorType,
+    error: unknown,
+    operation: CacheError["operation"],
+    message: string,
+    key?: string,
+  ): void {
+    if (!this.onError) return;
+    try {
+      this.onError({
+        type,
+        error: error instanceof Error ? error : new Error(String(error)),
+        operation,
+        message,
+        key,
+      });
+    } catch {
+      // Don't let callback errors propagate
+    }
   }
 
   /**
@@ -107,7 +185,22 @@ export class FileStore {
     );
     await Promise.all(shardPromises);
 
-    await this.loadIndex();
+    // Try to load from shared index first (faster), fall back to file scan
+    const loadedFromSharedIndex = await this.loadSharedIndex();
+    if (!loadedFromSharedIndex) {
+      await this.loadIndex();
+    }
+
+    // Start sync timer if experimental multi-process mode is enabled
+    if (this.experimentalMultiProcess) {
+      this.syncTimer = setInterval(() => {
+        this.sync().catch((err) => {
+          this.emitError("sync_error", err, "sync", "Periodic index sync failed");
+        });
+      }, this.syncInterval);
+      this.syncTimer.unref();
+    }
+
     this.initialized = true;
   }
 
@@ -163,8 +256,15 @@ export class FileStore {
       });
       this.hashToKey.set(hash, data.key);
       this.totalSize += stat.size;
-    } catch {
-      // Skip invalid files
+    } catch (err) {
+      // Emit error for corrupted/invalid files
+      const isSyntaxError = err instanceof SyntaxError;
+      this.emitError(
+        isSyntaxError ? "parse_error" : "read_error",
+        err,
+        "init",
+        `Failed to load cache file: ${filePath}`,
+      );
     }
   }
 
@@ -231,11 +331,24 @@ export class FileStore {
         return null;
       }
       return entry;
-    } catch {
+    } catch (err) {
       // File missing or corrupted - clean up index
       this.totalSize -= indexEntry.size;
       this.index.delete(key);
       this.hashToKey.delete(indexEntry.hash);
+
+      // Emit error (but not for ENOENT - that's expected for deleted files)
+      const isNotFound = err instanceof Error && "code" in err && err.code === "ENOENT";
+      if (!isNotFound) {
+        const isSyntaxError = err instanceof SyntaxError;
+        this.emitError(
+          isSyntaxError ? "parse_error" : "read_error",
+          err,
+          "get",
+          `Failed to read cache file for key`,
+          key,
+        );
+      }
       return null;
     }
   }
@@ -319,9 +432,11 @@ export class FileStore {
       expiresAt,
       lastAccessedAt: Date.now(),
       size,
+      valueHash: this.experimentalMultiProcess ? hashValue(serialized) : undefined,
     });
     this.hashToKey.set(hash, key);
     this.totalSize += size;
+    this.markIndexDirty();
   }
 
   /**
@@ -339,6 +454,7 @@ export class FileStore {
     this.totalSize -= indexEntry.size;
     this.index.delete(key);
     this.hashToKey.delete(indexEntry.hash);
+    this.markIndexDirty();
 
     try {
       await fs.unlink(filePath);
@@ -410,9 +526,14 @@ export class FileStore {
       this.totalSize += newSize - indexEntry.size;
       indexEntry.expiresAt = expiresAt;
       indexEntry.size = newSize;
+      if (this.experimentalMultiProcess) {
+        indexEntry.valueHash = hashValue(serialized);
+      }
+      this.markIndexDirty();
 
       return true;
-    } catch {
+    } catch (err) {
+      this.emitError("write_error", err, "expire", "Failed to update expiry", key);
       return false;
     }
   }
@@ -444,12 +565,17 @@ export class FileStore {
     const now = Date.now();
 
     indexEntry.lastAccessedAt = now;
+    this.markIndexDirty();
 
     try {
       const nowDate = new Date(now);
       await fs.utimes(filePath, nowDate, nowDate);
-    } catch {
-      // File may be gone, but index update still valid for this session
+    } catch (err) {
+      // File may be gone (ENOENT is expected), but other errors should be reported
+      const isNotFound = err instanceof Error && "code" in err && err.code === "ENOENT";
+      if (!isNotFound) {
+        this.emitError("write_error", err, "touch", "Failed to update file timestamp", key);
+      }
     }
 
     return true;
@@ -476,6 +602,7 @@ export class FileStore {
     this.index.clear();
     this.hashToKey.clear();
     this.totalSize = 0;
+    this.markIndexDirty();
   }
 
   /**
@@ -592,5 +719,518 @@ export class FileStore {
     }
 
     return freedSize;
+  }
+
+  // ============================================
+  // Multi-process sync methods
+  // ============================================
+
+  /**
+   * Get the path to the shared index file
+   */
+  private getSharedIndexPath(): string {
+    return join(this.dir, ".index.json");
+  }
+
+  /**
+   * Load index from the shared .index.json file.
+   * Returns true if successfully loaded, false if file doesn't exist or is invalid.
+   * Verifies that files exist on disk to handle crashes during deletion.
+   */
+  private async loadSharedIndex(): Promise<boolean> {
+    if (!this.experimentalMultiProcess) return false;
+
+    try {
+      const sharedIndex = await this.readSharedIndexWithRetry();
+      if (!sharedIndex) return false;
+
+      // Filter out expired entries
+      const now = Date.now();
+      const nonExpiredEntries = Object.entries(sharedIndex.entries).filter(
+        ([, entry]) => entry.expiresAt === null || entry.expiresAt > now,
+      );
+
+      // Verify files exist on disk (handles crashes during deletion)
+      const verifiedEntries = await this.filterExistingFiles(nonExpiredEntries);
+
+      this.index.clear();
+      this.hashToKey.clear();
+      this.totalSize = 0;
+
+      for (const [key, entry] of verifiedEntries) {
+        this.addForeignEntry(key, entry);
+      }
+
+      this.indexVersion = sharedIndex.version;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Batch check file existence for multiple entries.
+   * Returns entries whose files exist on disk.
+   * Processes in batches to avoid overwhelming the filesystem.
+   */
+  private async filterExistingFiles<T extends { hash: string }>(
+    entries: [string, T][],
+  ): Promise<Map<string, T>> {
+    const BATCH_SIZE = 100;
+    const existing = new Map<string, T>();
+
+    for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+      const batch = entries.slice(i, i + BATCH_SIZE);
+      const checks = batch.map(async ([key, entry]) => {
+        const filePath = this.getFilePath(entry.hash);
+        try {
+          await fs.access(filePath);
+          return [key, entry] as const;
+        } catch {
+          return null;
+        }
+      });
+
+      const results = await Promise.all(checks);
+      for (const result of results) {
+        if (result) {
+          existing.set(result[0], result[1]);
+        }
+      }
+    }
+
+    return existing;
+  }
+
+  /**
+   * Read the shared index file with retry logic for transient failures.
+   * Distinguishes between "file not found" (expected, no retry) and
+   * parse errors (possible torn read, retry with backoff).
+   */
+  private async readSharedIndexWithRetry(maxRetries: number = 3): Promise<SharedIndex | null> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const content = await fs.readFile(this.getSharedIndexPath(), "utf8");
+        return JSON.parse(content) as SharedIndex;
+      } catch (err: unknown) {
+        // File not found - no retry needed, this is expected on first run
+        if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+          return null;
+        }
+        // Parse error or other read error - likely torn read, retry
+        if (attempt < maxRetries - 1) {
+          const backoffMs = Math.min(5 * Math.pow(2, attempt) + Math.random() * 5, 50);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        // Exhausted retries
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Capture a point-in-time snapshot of the local index state.
+   * Used to guard against concurrent modifications during sync operations.
+   */
+  private snapshotLocalIndex(): {
+    keys: Set<string>;
+    entries: Map<string, IndexEntry>;
+  } {
+    return {
+      keys: new Set(this.index.keys()),
+      entries: new Map(this.index),
+    };
+  }
+
+  /**
+   * Pure function to merge local entries with foreign entries for writing.
+   * Foreign entries are added first, then local entries overlay (take precedence).
+   */
+  private buildMergedEntries(
+    localEntries: Map<string, IndexEntry>,
+    foreignEntries: Map<string, SharedIndexEntry>,
+  ): Record<string, SharedIndexEntry> {
+    const entries: Record<string, SharedIndexEntry> = {};
+
+    // Add foreign entries first
+    for (const [key, entry] of foreignEntries) {
+      entries[key] = entry;
+    }
+
+    // Overlay local entries (these take precedence)
+    for (const [key, entry] of localEntries) {
+      entries[key] = {
+        hash: entry.hash,
+        size: entry.size,
+        expiresAt: entry.expiresAt,
+        lastAccessedAt: entry.lastAccessedAt,
+        valueHash: entry.valueHash,
+      };
+    }
+
+    return entries;
+  }
+
+  /**
+   * Add an entry from another process to the local index.
+   */
+  private addForeignEntry(key: string, entry: SharedIndexEntry): void {
+    const indexEntry: IndexEntry = {
+      hash: entry.hash,
+      size: entry.size,
+      expiresAt: entry.expiresAt,
+      lastAccessedAt: entry.lastAccessedAt,
+      valueHash: entry.valueHash,
+    };
+    this.index.set(key, indexEntry);
+    this.hashToKey.set(entry.hash, key);
+    this.totalSize += entry.size;
+  }
+
+  /**
+   * Update an existing local entry with data from the shared index.
+   * Calls onInvalidate if the value changed (different valueHash).
+   */
+  private updateLocalEntryFromShared(key: string, sharedEntry: SharedIndexEntry): void {
+    const existing = this.index.get(key);
+    if (!existing) return;
+
+    // Check if value changed (different valueHash)
+    const valueChanged = sharedEntry.valueHash && existing.valueHash !== sharedEntry.valueHash;
+    if (valueChanged) {
+      existing.valueHash = sharedEntry.valueHash;
+      try {
+        this.onInvalidate?.(key);
+      } catch {
+        // Callback errors shouldn't fail the merge
+      }
+    }
+
+    // Update metadata
+    this.totalSize -= existing.size;
+    this.totalSize += sharedEntry.size;
+    existing.size = sharedEntry.size;
+    existing.expiresAt = sharedEntry.expiresAt;
+
+    // Keep local lastAccessedAt if more recent
+    if (sharedEntry.lastAccessedAt > existing.lastAccessedAt) {
+      existing.lastAccessedAt = sharedEntry.lastAccessedAt;
+    }
+  }
+
+  /**
+   * Remove keys that were deleted by other processes.
+   * Checks if files still exist before removing (handles race conditions).
+   */
+  private async removeDeletedKeys(sharedKeys: Set<string>): Promise<void> {
+    const keysNotInShared: [string, IndexEntry][] = [];
+    for (const [key, entry] of this.index) {
+      if (!sharedKeys.has(key)) {
+        keysNotInShared.push([key, entry]);
+      }
+    }
+
+    // Batch check which files still exist
+    const stillExisting = await this.filterExistingFiles(keysNotInShared);
+
+    for (const [key] of keysNotInShared) {
+      if (stillExisting.has(key)) continue;
+
+      const entry = this.index.get(key);
+      if (entry) {
+        this.totalSize -= entry.size;
+        this.index.delete(key);
+        this.hashToKey.delete(entry.hash);
+        try {
+          this.onEvict?.(key);
+        } catch {
+          // Callback errors shouldn't fail the merge
+        }
+      }
+    }
+  }
+
+  /**
+   * Verify that a write to the shared index persisted successfully.
+   * Handles concurrent overwrites by checking if our entries are present.
+   * Returns the actual observed version (fixes TOCTOU race condition).
+   */
+  private async verifyWriteSuccess(
+    expectedVersion: number,
+    localKeys: Set<string>,
+  ): Promise<{ success: boolean; actualVersion: number | null }> {
+    const verifyIndex = await this.readSharedIndexWithRetry(2);
+    if (!verifyIndex) {
+      // Read failed - assume success (best effort)
+      return { success: true, actualVersion: expectedVersion };
+    }
+
+    if (verifyIndex.version === expectedVersion) {
+      // Our write persisted directly
+      return { success: true, actualVersion: expectedVersion };
+    }
+
+    // Another process overwrote - check if our entries survived
+    // We verify key presence. If keys are present but valueHash differs,
+    // that's expected last-write-wins behavior at the filesystem level.
+    let allKeysPresent = true;
+    for (const key of localKeys) {
+      if (verifyIndex.entries[key] === undefined) {
+        allKeysPresent = false;
+        break;
+      }
+    }
+
+    if (allKeysPresent) {
+      // All our keys are in the index (merged by another process)
+      // Return the actual version we observed
+      return { success: true, actualVersion: verifyIndex.version };
+    }
+
+    // Some entries were lost - need retry
+    return { success: false, actualVersion: verifyIndex.version };
+  }
+
+  /**
+   * Write the current index to the shared .index.json file.
+   * Merges with existing shared index to preserve entries from other processes.
+   * Uses optimistic concurrency with retry to handle concurrent writers.
+   */
+  private async writeSharedIndex(): Promise<void> {
+    const MAX_RETRIES = 3;
+
+    // Snapshot local state to guard against concurrent modifications during write
+    const snapshot = this.snapshotLocalIndex();
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // Read existing shared index (with retry for torn reads)
+      const existingIndex = await this.readSharedIndexWithRetry();
+
+      // Get foreign entries (entries we don't have locally)
+      let foreignEntries = new Map<string, SharedIndexEntry>();
+      if (existingIndex) {
+        const foreign = Object.entries(existingIndex.entries).filter(
+          ([key]) => !snapshot.keys.has(key),
+        );
+        foreignEntries = await this.filterExistingFiles(foreign);
+      }
+
+      // Build merged entries using snapshot (not live index)
+      const entries = this.buildMergedEntries(snapshot.entries, foreignEntries);
+
+      const newVersion = (existingIndex?.version ?? 0) + 1;
+      const sharedIndex: SharedIndex = { version: newVersion, entries };
+
+      const content = JSON.stringify(sharedIndex);
+      await this.atomicWrite(this.getSharedIndexPath(), Buffer.from(content, "utf8"));
+
+      // Verify write and get actual version (fixes TOCTOU race)
+      const verification = await this.verifyWriteSuccess(newVersion, snapshot.keys);
+
+      if (verification.success) {
+        this.indexVersion = verification.actualVersion ?? newVersion;
+        this.indexDirty = false;
+        return;
+      }
+
+      // Retry with backoff
+      if (attempt < MAX_RETRIES - 1) {
+        const backoffMs = Math.min(10 * Math.pow(2, attempt) + Math.random() * 10, 100);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+    }
+
+    // Exhausted retries - keep indexDirty=true so next sync interval retries
+  }
+
+  // Track when debouncing started for max wait enforcement
+  private debounceStartTime?: number;
+
+  /**
+   * Schedule a debounced index write.
+   * Writes are debounced to reduce disk I/O when many mutations happen quickly.
+   * Uses true debounce (resets timer on each write) with a max wait time.
+   */
+  private scheduleIndexWrite(): void {
+    if (!this.experimentalMultiProcess) return;
+
+    this.indexDirty = true;
+
+    const debounceMs = Math.min(100, this.syncInterval);
+    const maxWaitMs = this.syncInterval;
+
+    // Track when we started debouncing (for max wait enforcement)
+    if (!this.debounceStartTime) {
+      this.debounceStartTime = Date.now();
+    }
+
+    // Check if we've waited too long - if so, write immediately
+    const elapsed = Date.now() - this.debounceStartTime;
+    if (elapsed >= maxWaitMs) {
+      if (this.indexWriteTimer) {
+        clearTimeout(this.indexWriteTimer);
+        this.indexWriteTimer = undefined;
+      }
+      this.debounceStartTime = undefined;
+      this.pendingIndexWrite = this.executeIndexWrite();
+      return;
+    }
+
+    // Reset the timer on each write (true debounce behavior)
+    if (this.indexWriteTimer) {
+      clearTimeout(this.indexWriteTimer);
+    }
+
+    this.indexWriteTimer = setTimeout(() => {
+      this.indexWriteTimer = undefined;
+      this.debounceStartTime = undefined;
+      this.pendingIndexWrite = this.executeIndexWrite();
+    }, debounceMs);
+    this.indexWriteTimer.unref();
+  }
+
+  /**
+   * Execute the actual index write, calling onBeforeSync first to flush pending writes.
+   */
+  private async executeIndexWrite(): Promise<void> {
+    if (!this.indexDirty) return;
+
+    try {
+      // Flush pending writes first to ensure index reflects disk state
+      await this.onBeforeSync?.();
+      await this.writeSharedIndex();
+    } catch (err) {
+      // Index write failures are non-fatal but should be reported
+      this.emitError("sync_error", err, "sync", "Failed to write shared index");
+    }
+  }
+
+  /**
+   * Sync with the shared index file.
+   * Uses a mutex to prevent concurrent syncs from racing.
+   */
+  async sync(): Promise<void> {
+    // If a sync is already in progress, wait for it instead of starting another
+    if (this.syncInProgress) {
+      return this.syncInProgress;
+    }
+
+    this.syncInProgress = this.doSync();
+    try {
+      await this.syncInProgress;
+    } finally {
+      this.syncInProgress = undefined;
+    }
+  }
+
+  /**
+   * Internal sync implementation.
+   * 1. Flush pending writes
+   * 2. Write local changes if dirty
+   * 3. Read and merge changes from other processes
+   */
+  private async doSync(): Promise<void> {
+    await this.init();
+
+    // Flush pending writes from cache layer
+    await this.onBeforeSync?.();
+
+    // Wait for any pending index write
+    if (this.pendingIndexWrite) {
+      await this.pendingIndexWrite;
+    }
+
+    // Write our changes if dirty
+    if (this.indexDirty) {
+      await this.writeSharedIndex();
+    }
+
+    // Read and merge changes from other processes
+    await this.mergeSharedIndex();
+  }
+
+  /**
+   * Read the shared index and merge changes from other processes.
+   */
+  private async mergeSharedIndex(): Promise<void> {
+    try {
+      const sharedIndex = await this.readSharedIndexWithRetry();
+      if (!sharedIndex) return;
+
+      // If our version is current, nothing to merge
+      if (sharedIndex.version <= this.indexVersion) return;
+
+      const sharedKeys = new Set(Object.keys(sharedIndex.entries));
+      const now = Date.now();
+
+      // Filter out expired entries and separate foreign from local
+      const nonExpiredEntries = Object.entries(sharedIndex.entries).filter(
+        ([, entry]) => entry.expiresAt === null || entry.expiresAt > now,
+      );
+      const foreignEntries = nonExpiredEntries.filter(([key]) => !this.index.has(key));
+      const localEntries = nonExpiredEntries.filter(([key]) => this.index.has(key));
+
+      // Only verify foreign entries exist on disk
+      const verifiedForeignEntries = await this.filterExistingFiles(foreignEntries);
+
+      // Add new entries from other processes
+      for (const [key, entry] of verifiedForeignEntries) {
+        this.addForeignEntry(key, entry);
+      }
+
+      // Update local entries that may have changed
+      for (const [key, entry] of localEntries) {
+        this.updateLocalEntryFromShared(key, entry);
+      }
+
+      // Remove keys deleted by other processes
+      await this.removeDeletedKeys(sharedKeys);
+
+      this.indexVersion = sharedIndex.version;
+    } catch (err) {
+      // Merge failures are non-fatal - we'll try again on next sync
+      this.emitError("sync_error", err, "sync", "Failed to merge shared index");
+    }
+  }
+
+  /**
+   * Mark the index as dirty, scheduling a write if sync is enabled.
+   */
+  markIndexDirty(): void {
+    this.scheduleIndexWrite();
+  }
+
+  /**
+   * Stop sync timer and flush pending index writes.
+   */
+  async close(): Promise<void> {
+    // Stop timers first to prevent new syncs from starting
+    if (this.syncTimer) {
+      clearInterval(this.syncTimer);
+      this.syncTimer = undefined;
+    }
+
+    if (this.indexWriteTimer) {
+      clearTimeout(this.indexWriteTimer);
+      this.indexWriteTimer = undefined;
+    }
+
+    // Wait for any in-progress sync to complete before final write
+    if (this.syncInProgress) {
+      await this.syncInProgress;
+    }
+
+    // Wait for any pending index write to complete
+    if (this.pendingIndexWrite) {
+      await this.pendingIndexWrite;
+    }
+
+    // Final index write if still dirty after waiting
+    if (this.indexDirty && this.experimentalMultiProcess) {
+      await this.onBeforeSync?.();
+      await this.writeSharedIndex();
+    }
   }
 }

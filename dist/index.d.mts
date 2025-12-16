@@ -29,6 +29,40 @@ interface CacheOptions {
   pruneInterval?: number;
   /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
   syncWrites?: boolean;
+  /**
+   * Enable experimental multi-process mode for sharing cache across processes (default: false).
+   * When enabled, the cache coordinates with other processes via a shared index file.
+   *
+   * @remarks
+   * **Experimental multi-process behavior:**
+   * - Writes are immediately visible to the writing process
+   * - Other processes see writes within syncInterval ms
+   * - LRU ordering is approximate (each process tracks its own access times)
+   * - Size limits are approximate (may temporarily exceed by ~N×maxSize where N = process count)
+   * - Stampede protection works within a process only
+   */
+  experimentalMultiProcess?: boolean;
+  /**
+   * Interval in ms to sync index with other processes (default: 1000).
+   * Only used when experimentalMultiProcess is true.
+   */
+  syncInterval?: number;
+  /**
+   * Callback for error events.
+   * Called when recoverable errors occur during cache operations.
+   * Useful for logging, monitoring, and alerting on potential problems.
+   *
+   * @example
+   * ```ts
+   * const cache = new FsLruCache({
+   *   onError: (err) => {
+   *     console.error(`Cache ${err.type}: ${err.message}`, err.error);
+   *     metrics.increment(`cache.errors.${err.type}`);
+   *   }
+   * });
+   * ```
+   */
+  onError?: ErrorCallback;
 }
 interface CacheEntry<T = unknown> {
   /** The cache key */
@@ -37,6 +71,21 @@ interface CacheEntry<T = unknown> {
   value: T;
   /** Expiration timestamp in ms, or null if no expiry */
   expiresAt: number | null;
+}
+/**
+ * Error counters by type.
+ */
+interface ErrorStats {
+  /** File read failures */
+  readErrors: number;
+  /** JSON parse failures */
+  parseErrors: number;
+  /** File write failures */
+  writeErrors: number;
+  /** Index sync failures (multi-process mode) */
+  syncErrors: number;
+  /** Value integrity failures */
+  integrityErrors: number;
 }
 interface CacheStats {
   /** Total cache hits */
@@ -59,7 +108,41 @@ interface CacheStats {
   };
   /** Number of pending async disk writes */
   pendingWrites: number;
+  /** Error counters by type */
+  errors: ErrorStats;
 }
+/**
+ * Error categories for cache operations.
+ * Used with the onError callback to classify error types.
+ */
+type CacheErrorType = /** File read failed (I/O error, permission denied, etc.) */
+"read_error"
+/** JSON parse failed (corrupted data, partial write, etc.) */ | "parse_error"
+/** File write failed (disk full, permission denied, etc.) */ | "write_error"
+/** Index sync failed in multi-process mode */ | "sync_error"
+/** Value hash mismatch (potential data corruption) */ | "integrity_error";
+/**
+ * Error event emitted by the cache.
+ * Contains the error type, original error, and context about the operation.
+ */
+interface CacheError {
+  /** Category of error */
+  type: CacheErrorType;
+  /** The underlying error */
+  error: Error;
+  /** Cache key involved (if applicable) */
+  key?: string;
+  /** Operation that failed */
+  operation: "get" | "set" | "delete" | "sync" | "prune" | "init" | "touch" | "expire";
+  /** Additional context */
+  message: string;
+}
+/**
+ * Callback for error events.
+ * Called when recoverable errors occur during cache operations.
+ * The cache will continue operating after these errors.
+ */
+type ErrorCallback = (error: CacheError) => void;
 declare const DEFAULT_OPTIONS: {
   dir: string;
   maxMemoryItems: number;
@@ -71,6 +154,8 @@ declare const DEFAULT_OPTIONS: {
   gzip: boolean;
   pruneInterval: number | undefined;
   syncWrites: boolean;
+  experimentalMultiProcess: boolean;
+  syncInterval: number;
 };
 //#endregion
 //#region src/cache.d.ts
@@ -92,9 +177,11 @@ declare class FsLruCache {
   private readonly defaultTtl?;
   private readonly namespace?;
   private readonly syncWrites;
+  private readonly onError?;
   private hits;
   private misses;
   private closed;
+  private errorStats;
   private inFlight;
   /**
    * Pending async disk writes per key.
@@ -125,6 +212,10 @@ declare class FsLruCache {
    */
   private resolveTtl;
   private assertOpen;
+  /**
+   * Handle an error event: increment counters and forward to user callback.
+   */
+  private handleError;
   /**
    * Schedule a debounced touch for the file store.
    * Coalesces frequent accesses to reduce disk I/O.
@@ -242,7 +333,7 @@ declare class FsLruCache {
    */
   stats(): Promise<CacheStats>;
   /**
-   * Reset hit/miss counters.
+   * Reset hit/miss counters and error stats.
    */
   resetStats(): void;
   /**
@@ -250,6 +341,20 @@ declare class FsLruCache {
    * Useful when you need to ensure data is persisted before reading stats or shutting down.
    */
   flush(): Promise<void>;
+  /**
+   * Flush pending disk writes only (without touches).
+   * Used internally before index sync operations.
+   */
+  private flushPendingWrites;
+  /**
+   * Force immediate synchronization with the shared index file.
+   * This flushes all pending writes, writes the local index, and reads
+   * any changes from other processes sharing the same cache directory.
+   *
+   * Only useful when syncInterval > 0 (multi-process mode).
+   * Call this before critical reads that need the freshest data from other processes.
+   */
+  forceSync(): Promise<void>;
   /**
    * Clear all entries from the cache.
    */

@@ -28,6 +28,40 @@ export interface CacheOptions {
   pruneInterval?: number;
   /** Block on disk writes (default: false). When false, writes return immediately after updating memory. */
   syncWrites?: boolean;
+  /**
+   * Enable experimental multi-process mode for sharing cache across processes (default: false).
+   * When enabled, the cache coordinates with other processes via a shared index file.
+   *
+   * @remarks
+   * **Experimental multi-process behavior:**
+   * - Writes are immediately visible to the writing process
+   * - Other processes see writes within syncInterval ms
+   * - LRU ordering is approximate (each process tracks its own access times)
+   * - Size limits are approximate (may temporarily exceed by ~N×maxSize where N = process count)
+   * - Stampede protection works within a process only
+   */
+  experimentalMultiProcess?: boolean;
+  /**
+   * Interval in ms to sync index with other processes (default: 1000).
+   * Only used when experimentalMultiProcess is true.
+   */
+  syncInterval?: number;
+  /**
+   * Callback for error events.
+   * Called when recoverable errors occur during cache operations.
+   * Useful for logging, monitoring, and alerting on potential problems.
+   *
+   * @example
+   * ```ts
+   * const cache = new FsLruCache({
+   *   onError: (err) => {
+   *     console.error(`Cache ${err.type}: ${err.message}`, err.error);
+   *     metrics.increment(`cache.errors.${err.type}`);
+   *   }
+   * });
+   * ```
+   */
+  onError?: ErrorCallback;
 }
 
 export interface CacheEntry<T = unknown> {
@@ -48,6 +82,22 @@ export interface MemoryEntry {
   expiresAt: number | null;
   /** Size in bytes */
   size: number;
+}
+
+/**
+ * Error counters by type.
+ */
+export interface ErrorStats {
+  /** File read failures */
+  readErrors: number;
+  /** JSON parse failures */
+  parseErrors: number;
+  /** File write failures */
+  writeErrors: number;
+  /** Index sync failures (multi-process mode) */
+  syncErrors: number;
+  /** Value integrity failures */
+  integrityErrors: number;
 }
 
 export interface CacheStats {
@@ -71,6 +121,8 @@ export interface CacheStats {
   };
   /** Number of pending async disk writes */
   pendingWrites: number;
+  /** Error counters by type */
+  errors: ErrorStats;
 }
 
 /**
@@ -89,6 +141,46 @@ export interface PendingWrite {
   promise: Promise<void>;
 }
 
+/**
+ * Error categories for cache operations.
+ * Used with the onError callback to classify error types.
+ */
+export type CacheErrorType =
+  /** File read failed (I/O error, permission denied, etc.) */
+  | "read_error"
+  /** JSON parse failed (corrupted data, partial write, etc.) */
+  | "parse_error"
+  /** File write failed (disk full, permission denied, etc.) */
+  | "write_error"
+  /** Index sync failed in multi-process mode */
+  | "sync_error"
+  /** Value hash mismatch (potential data corruption) */
+  | "integrity_error";
+
+/**
+ * Error event emitted by the cache.
+ * Contains the error type, original error, and context about the operation.
+ */
+export interface CacheError {
+  /** Category of error */
+  type: CacheErrorType;
+  /** The underlying error */
+  error: Error;
+  /** Cache key involved (if applicable) */
+  key?: string;
+  /** Operation that failed */
+  operation: "get" | "set" | "delete" | "sync" | "prune" | "init" | "touch" | "expire";
+  /** Additional context */
+  message: string;
+}
+
+/**
+ * Callback for error events.
+ * Called when recoverable errors occur during cache operations.
+ * The cache will continue operating after these errors.
+ */
+export type ErrorCallback = (error: CacheError) => void;
+
 export const DEFAULT_OPTIONS = {
   dir: ".cache",
   maxMemoryItems: 1000,
@@ -100,4 +192,33 @@ export const DEFAULT_OPTIONS = {
   gzip: false,
   pruneInterval: undefined as number | undefined,
   syncWrites: false,
+  experimentalMultiProcess: false,
+  syncInterval: 1000,
 };
+
+/**
+ * Entry in the shared index file for multi-process coordination.
+ */
+export interface SharedIndexEntry {
+  /** Hash of the key (used as filename) */
+  hash: string;
+  /** Size of the compressed file in bytes */
+  size: number;
+  /** Expiration timestamp in ms, or null if no expiry */
+  expiresAt: number | null;
+  /** Last access timestamp in ms (for LRU ordering) */
+  lastAccessedAt: number;
+  /** Hash of the value content (to detect overwrites by other processes) */
+  valueHash?: string;
+}
+
+/**
+ * Shared index file format for multi-process coordination.
+ * Written to {cacheDir}/.index.json
+ */
+export interface SharedIndex {
+  /** Version number, incremented on every write */
+  version: number;
+  /** Map of key -> metadata */
+  entries: Record<string, SharedIndexEntry>;
+}
